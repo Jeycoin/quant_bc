@@ -1,0 +1,27 @@
+# Trading mode is decided by LIVE_TRADING env var, not by this file.
+# These limits are the agent-facing safety boundary. The agent may tune
+# strategy parameters inside these bounds; it may not widen the bounds.
+
+safety:
+  # Connectors the agent is allowed to trade on in PAPER mode.
+  paper_connector_patterns:
+    - "_paper_trade"   # e.g. binance_paper_trade
+    - "testnet"        # e.g. hyperliquid testnet connectors
+
+  # Symbols the agent may analyze and trade.
+  # Note: hyperliquid perp pairs are quoted in USD (BTC-USD), spot in USDC (UBTC-USDC).
+  allowed_quote_assets: ["USDT", "USDC", "USD"]
+  allowed_base_assets: ["BTC", "UBTC", "ETH", "UETH", "SOL"]
+
+  # Hard per-trade limits (quote currency).
+  max_order_quote_amount: 500
+  max_open_positions: 3
+
+  # Tool-call rules: actions the agent can never invoke, in any mode.
+  blocked_tool_actions:
+    setup_connector: ["delete"]        # never delete credentials
+    manage_bots: []                    # bot lifecycle allowed
+    manage_executors: []               # executors allowed (subject to paper checks)
+
+memory:
+  sqlite_path: "data/agent_memory.db"
