@@ -76,3 +76,27 @@ Only add when the agent actually needs them.
 Agent prompts/workflows, safety boundary (agent/safety.py — the MCP layer
 has no paper mode or spend limits), decision/review memory
 (agent/memory/store.py), research/review reporting.
+
+## Grid backtest findings (2026-09-27, scripts/backtest_grid.py)
+
+Backtester: Hyperliquid public API 1h candles, candle-range touch fills,
+flat 0.04% fee per side. BTC 30d (79.5K → 84.9K, trending):
+
+| tp/level | trades | grid PnL ($300) | buy&hold |
+|---|---|---|---|
+| 0.02% (live config) | 967 | **-$17.46** | +$20.29 |
+| 0.1% | 177 | -$6.20 | +$20.29 |
+| 0.2% | 173 | +$0.12 | +$20.29 |
+| 0.5% | 67 | +$5.13 | +$20.29 |
+
+Ranging window (5d, 83.2K–85.2K, tp=0.2%): grid **+$4.09** vs buy&hold
+**-$3.63**.
+
+Conclusions:
+1. **Fee floor**: per-level take-profit must exceed ~2× the round-trip fee
+   or the grid is structurally loss-making. The 0.02% live config loses on
+   any real fee schedule — testnet "profit" was an artifact.
+2. Grid beats buy&hold only in ranging regimes; it caps upside in trends.
+   This is exactly the regime-selection value the agent is meant to add.
+3. Backtest limits: 1h candle granularity, no intrabar path, no slippage
+   model, flat fee — use for parameter sanity checks, not precision.
