@@ -64,6 +64,28 @@ regime-attribution analytics. Use UNCERTAIN when evidence is mixed;
 regime is a classification of the current market state, not a price
 prediction.
 
+# Structured review output
+
+When you review a completed trade/executor, append one structured block
+per reviewed executor at the very end of your reply, in addition to the
+prose review. Only conclusions — never reasoning or chain-of-thought.
+decision_quality values:
+- good: the decision matched the information available at the time and
+  the outcome is consistent with it
+- bad: clear counter-evidence existed at decision time but was ignored
+- unclear: not enough information to judge
+- execution_failure: the decision was reasonable but execution failed
+
+```review
+{"execution_id": "executor id", "outcome": "+0.18 USDT in 8.4h",
+ "decision_quality": "good|bad|unclear|execution_failure",
+ "execution_quality": "one short phrase",
+ "regime_accuracy": "accurate|inaccurate|unclear",
+ "main_error": "one short phrase or empty",
+ "main_success": "one short phrase or empty",
+ "lesson": "one sentence"}
+```
+
 # Review
 
 When asked for a review, analyze past decisions and trades: what was

@@ -38,6 +38,7 @@ PROMPT_PATH = Path(__file__).parent / "prompts" / "trading_manager.md"
 MAX_TOOL_ROUNDS = 25
 
 _ANALYSIS_BLOCK = re.compile(r"```analysis\s*(\{.*?\})\s*```", re.DOTALL)
+_REVIEW_BLOCK = re.compile(r"```review\s*(\{.*?\})\s*```", re.DOTALL)
 _EXECUTOR_ID = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,48}")
 
 _STANDARD_REGIMES = {
@@ -76,8 +77,17 @@ def extract_executor_id(result_text: str) -> str | None:
 
 def extract_analysis_blocks(text: str) -> list[dict[str, Any]]:
     """Pull structured market-analysis blocks out of a final reply."""
+    return _extract_blocks(_ANALYSIS_BLOCK, text)
+
+
+def extract_review_blocks(text: str) -> list[dict[str, Any]]:
+    """Pull structured trade-review blocks out of a final reply."""
+    return _extract_blocks(_REVIEW_BLOCK, text)
+
+
+def _extract_blocks(pattern: re.Pattern[str], text: str) -> list[dict[str, Any]]:
     blocks = []
-    for match in _ANALYSIS_BLOCK.finditer(text or ""):
+    for match in pattern.finditer(text or ""):
         try:
             data = json.loads(match.group(1))
         except json.JSONDecodeError:
@@ -114,6 +124,19 @@ class TradingAgent:
         self._created_executors: list[str] = []
         self._blocked = False
         self._market_snapshot: dict[str, Any] = {}
+        # Set when a memory write fails — degraded mode: no new trades
+        # (master prompt §28: never trade freely when memory is down).
+        self._memory_broken = False
+
+    def _safe_record(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        """Memory writes are best-effort; a failure flips degraded mode."""
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            self._memory_broken = True
+            print(f"[warn] memory write failed, degraded mode on: {exc}",
+                  file=sys.stderr)
+            return None
 
     async def _ensure_session(self) -> tuple[ClientSession, list[dict[str, Any]]]:
         async with self._lock:
@@ -160,7 +183,8 @@ class TradingAgent:
         messages.append({"role": "user", "content": user_message})
         answer = await self._tool_loop(session, tools, messages)
         for block in extract_analysis_blocks(answer):
-            self.memory.record_analysis(
+            self._safe_record(
+                self.memory.record_analysis,
                 mode=self.guard.mode,
                 symbol=block.get("symbol"),
                 regime=block.get("regime"),
@@ -172,6 +196,30 @@ class TradingAgent:
                 evidence=block.get("evidence"),
                 raw=json.dumps(block, ensure_ascii=False),
             )
+        review_blocks = extract_review_blocks(answer)
+        if review_blocks:
+            self._safe_record(
+                self.memory.record_review,
+                subject=review_blocks[0].get("execution_id") or "review",
+                review=answer,
+            )
+            if self.analytics is not None:
+                for block in review_blocks:
+                    try:
+                        self.analytics.record_review_event(
+                            decision_id=decision_id,
+                            execution_id=block.get("execution_id"),
+                            outcome=block.get("outcome"),
+                            decision_quality=block.get("decision_quality"),
+                            execution_quality=block.get("execution_quality"),
+                            regime_accuracy=block.get("regime_accuracy"),
+                            main_error=block.get("main_error"),
+                            main_success=block.get("main_success"),
+                            lesson=block.get("lesson"),
+                            raw=json.dumps(block, ensure_ascii=False),
+                        )
+                    except Exception:
+                        pass  # analytics path must never break trading
         self._record_decision_events(decision_id, answer, portfolio_ctx)
         return answer
 
@@ -310,7 +358,8 @@ class TradingAgent:
             await self._check_position_capacity(name, arguments)
         except SafetyViolation as exc:
             self._blocked = True
-            self.memory.record_decision(
+            self._safe_record(
+                self.memory.record_decision,
                 mode=self.guard.mode,
                 market_context="",
                 analysis="",
@@ -333,7 +382,8 @@ class TradingAgent:
                 # Keep the freshest market data reply as this run's market
                 # snapshot for decision replay (truncated; no reasoning).
                 self._market_snapshot = {"tool_result": text[:4000]}
-        self.memory.record_decision(
+        self._safe_record(
+            self.memory.record_decision,
             mode=self.guard.mode,
             market_context="",
             analysis="",
@@ -347,6 +397,11 @@ class TradingAgent:
         """Enforce max_open_positions before creating a new executor."""
         if name != "manage_executors" or arguments.get("action") != "create":
             return
+        if self._memory_broken:
+            raise SafetyViolation(
+                "Degraded mode: memory store unavailable — new executors "
+                "disabled until memory recovers (analysis still allowed)."
+            )
         max_positions = self.guard.config["safety"].get("max_open_positions")
         if not max_positions:
             return
