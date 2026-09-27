@@ -44,6 +44,28 @@ export type Position = {
   entry_price: number;
   unrealized_pnl: number;
   leverage: number;
+  mark_price?: number | null;
+  mark_change_pct?: number | null;
+};
+
+export type Order = {
+  order_id: string;
+  account_name: string;
+  connector_name: string;
+  trading_pair: string;
+  trade_type: string;
+  order_type: string;
+  amount: number;
+  price: number;
+  status: string;
+  filled_amount: number | null;
+  average_fill_price: number | null;
+  fee_paid: number | null;
+  fee_currency: string | null;
+  created_at: string;
+  updated_at: string;
+  exchange_order_id: string | null;
+  error_message: string | null;
 };
 
 export type Overview = {
@@ -71,4 +93,10 @@ export const api = {
   health: () => get<Health>("/api/health"),
   overview: () => get<Overview>("/api/overview"),
   decisions: (limit = 50) => get<{ data: Decision[] }>(`/api/memory/decisions?limit=${limit}`),
+  orders: (status?: string, limit = 100) =>
+    get<{ data: Order[] }>(
+      `/api/orders?limit=${limit}${status ? `&status=${status}` : ""}`
+    ),
+  activeOrders: () => get<{ data: Order[] }>("/api/orders/active"),
+  positions: () => get<{ data: Position[] }>("/api/positions"),
 };

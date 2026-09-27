@@ -142,6 +142,69 @@ async def get_overview() -> dict[str, Any]:
     }
 
 
+async def _hb_call(method: str, path: str, **kwargs: Any) -> Any:
+    """Shared error mapping for read-only Hummingbot calls."""
+    try:
+        return await hb.call(method, path, **kwargs)
+    except EndpointNotAllowed as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Hummingbot API error: {exc}") from exc
+
+
+@app.get("/api/orders")
+async def get_orders(
+    status: str | None = None,
+    trading_pair: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"limit": max(1, min(limit, 500))}
+    if status:
+        payload["status"] = status
+    if trading_pair:
+        payload["trading_pairs"] = [trading_pair]
+    return await _hb_call("POST", "/trading/orders/search", json=payload)
+
+
+@app.get("/api/orders/active")
+async def get_active_orders() -> dict[str, Any]:
+    return await _hb_call("POST", "/trading/orders/active", json={})
+
+
+@app.get("/api/positions")
+async def get_positions() -> dict[str, Any]:
+    positions = await _hb_call("POST", "/trading/positions", json={})
+    rows = positions.get("data", []) if isinstance(positions, dict) else []
+
+    # Indicative mark prices from the live market-data connector (execution
+    # happens on testnet connectors, which expose no market data feed).
+    marks: dict[str, float | None] = {}
+    for row in rows:
+        base = str(row.get("trading_pair", "")).partition("-")[0]
+        if not base or base in marks:
+            continue
+        try:
+            res = await hb.call(
+                "POST",
+                "/market-data/prices",
+                json={"connector_name": MARKET_PROBE_CONNECTOR,
+                      "trading_pairs": [f"{base}-USD"]},
+            )
+            marks[base] = (res.get("prices") or {}).get(f"{base}-USD")
+        except Exception:
+            marks[base] = None
+
+    for row in rows:
+        base = str(row.get("trading_pair", "")).partition("-")[0]
+        row["mark_price"] = marks.get(base)
+        entry = row.get("entry_price") or 0
+        mark = row.get("mark_price")
+        row["mark_change_pct"] = (
+            (mark - entry) / entry * 100 if mark and entry else None
+        )
+    return {"data": rows}
+
+
 @app.get("/api/memory/decisions")
 async def get_decisions(limit: int = 50) -> dict[str, Any]:
     limit = max(1, min(limit, 200))
