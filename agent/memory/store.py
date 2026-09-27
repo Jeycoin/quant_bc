@@ -35,6 +35,20 @@ CREATE TABLE IF NOT EXISTS research_notes (
     topic TEXT NOT NULL,
     note TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS market_analysis (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    mode TEXT NOT NULL,
+    symbol TEXT,
+    regime TEXT,
+    trend TEXT,
+    volatility TEXT,
+    action TEXT,
+    strategy TEXT,
+    confidence REAL,
+    evidence TEXT,
+    raw TEXT
+);
 """
 
 
@@ -90,6 +104,50 @@ class MemoryStore:
         )
         self._conn.commit()
         return cur.lastrowid
+
+    def record_analysis(
+        self,
+        mode: str,
+        symbol: str | None = None,
+        regime: str | None = None,
+        trend: str | None = None,
+        volatility: str | None = None,
+        action: str | None = None,
+        strategy: str | None = None,
+        confidence: float | None = None,
+        evidence: str | None = None,
+        raw: str | None = None,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO market_analysis"
+            " (ts, mode, symbol, regime, trend, volatility, action, strategy,"
+            " confidence, evidence, raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                time.time(), mode, symbol, regime, trend, volatility,
+                action, strategy, confidence, evidence, raw,
+            ),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def latest_analysis(self, symbol: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        if symbol:
+            rows = self._conn.execute(
+                "SELECT id, ts, mode, symbol, regime, trend, volatility, action,"
+                " strategy, confidence, evidence FROM market_analysis"
+                " WHERE symbol = ? ORDER BY id DESC LIMIT ?",
+                (symbol, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, ts, mode, symbol, regime, trend, volatility, action,"
+                " strategy, confidence, evidence FROM market_analysis"
+                " ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        keys = ["id", "ts", "mode", "symbol", "regime", "trend", "volatility",
+                "action", "strategy", "confidence", "evidence"]
+        return [dict(zip(keys, r)) for r in rows]
 
     def recent_decisions(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self._conn.execute(

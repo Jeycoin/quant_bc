@@ -1,8 +1,11 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import { Area, AreaChart, ResponsiveContainer, Tooltip, YAxis } from "recharts";
 import { api } from "@/lib/api";
 import { StatCard } from "@/components/stat-card";
+import { AiMarketView } from "@/components/ai-market-view";
+import { Timeline } from "@/components/timeline";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -61,7 +64,12 @@ export default function OverviewPage() {
           tone={pnl > 0 ? "up" : pnl < 0 ? "down" : "neutral"}
           sub={`volume ${fmtUsd(d.executors.total_volume_quote ?? 0)}`}
         />
-        <StatCard title="Drawdown" value="—" sub="phase 2: equity history" />
+        <StatCard
+          title="Drawdown"
+          value={`${d.drawdown_pct.toFixed(2)}%`}
+          tone={d.drawdown_pct > 5 ? "down" : "neutral"}
+          sub={`peak ${fmtUsd(d.peak_equity)}`}
+        />
         <StatCard
           title="Active Executors"
           value={String(d.executors.total_active ?? 0)}
@@ -140,6 +148,55 @@ export default function OverviewPage() {
           </CardContent>
         </Card>
       </div>
+
+      {d.equity_history.length >= 2 && (
+        <Card className="bg-card/60">
+          <CardHeader>
+            <CardTitle className="text-sm">Equity Curve</CardTitle>
+          </CardHeader>
+          <CardContent className="h-40">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={d.equity_history}>
+                <defs>
+                  <linearGradient id="eq" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#34d399" stopOpacity={0.3} />
+                    <stop offset="100%" stopColor="#34d399" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <YAxis
+                  domain={["auto", "auto"]}
+                  tick={{ fontSize: 10, fill: "#71717a" }}
+                  tickFormatter={(v: number) => `$${(v / 1000).toFixed(1)}k`}
+                  width={50}
+                />
+                <Tooltip
+                  contentStyle={{ background: "#18181b", border: "1px solid #27272a", fontSize: 12 }}
+                  labelFormatter={(ts) => new Date(Number(ts) * 1000).toLocaleString("zh-CN", { hour12: false })}
+                  formatter={(v) => [fmtUsd(Number(v)), "Equity"]}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="equity"
+                  stroke="#34d399"
+                  fill="url(#eq)"
+                  strokeWidth={1.5}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      )}
+
+      <AiMarketView />
+
+      <Card className="bg-card/60">
+        <CardHeader>
+          <CardTitle className="text-sm">Recent AI Decisions</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Timeline limit={10} compact />
+        </CardContent>
+      </Card>
     </div>
   );
 }

@@ -216,8 +216,28 @@ pnpm dev          # 开发模式；或 pnpm build && pnpm start
 ```
 
 打开 http://localhost:3000 ：顶栏显示五项系统健康状态（AGENT / HUMMINGBOT /
-MCP / EXCHANGE / DATABASE）和当前交易模式（TESTNET / LIVE），Overview 页显示
-净值、执行器盈亏、余额和持仓，每 10 秒自动刷新。
+MCP / EXCHANGE / DATABASE）、当前交易模式（TESTNET / LIVE），以及 BTC/ETH
+实时价格（SSE 推送，断线自动重连）。
+
+页面：
+
+- **Overview** — 净值、日/总盈亏、回撤（基于净值快照）、执行器盈亏、余额、
+  持仓、AI Market View（BTC/ETH 的 regime/trend/action/confidence + 证据摘要）、
+  净值曲线、最近 AI 决策
+- **Market** — BTC/ETH K线图（lightweight-charts）、成交量、资金费率、价差，
+  以及该币种最新的 AI 市场分析
+- **Executors** — 运行中/已终止执行器，网格执行器显示价格区间和网格层
+- **Orders / Positions** — 订单和持仓明细
+- **Timeline** — AI 决策时间线（MARKET_SCAN → ANALYSIS → EXECUTOR_CREATED →
+  ORDER → FILL → REVIEW），只展示结构化摘要，不含模型内部推理
+- **Journal** — 历史交易复盘（执行器 ⋈ trade_reviews），支持按币种/策略/盈亏筛选
+- **Memory** — Agent 记忆四 Tab：Analysis / Decisions / Reviews / Notes
+
+AI Market View 的数据来源：Agent 每次分析后在回复末尾输出 ```analysis JSON 块，
+`agent/agent.py` 解析后写入 memory 库的 `market_analysis` 表，Dashboard 只读展示。
+若某币种显示"暂无分析"，说明 Agent 还没分析过它，跑一次分析即可。
+
+净值快照存储在 `data/dashboard.db`（60 秒节流），回撤和净值曲线随使用逐渐积累。
 
 安全设计：`dashboard_api/hummingbot.py` 用端点白名单约束后端能调用的
 Hummingbot API——下单、撤单、创建执行器等写接口在代码层面不可达。

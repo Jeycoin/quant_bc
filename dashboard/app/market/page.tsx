@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { CandleChart } from "@/components/candle-chart";
+import { AnalysisCard } from "@/components/ai-market-view";
 import { StatCard } from "@/components/stat-card";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -120,20 +121,7 @@ export default function MarketPage() {
           </CardContent>
         </Card>
 
-        <Card className="border-dashed bg-card/40">
-          <CardHeader>
-            <CardTitle className="text-sm">AI Market Analysis</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-muted-foreground">
-            <p>
-              Phase 5 接入：Agent 的结构化市场判断（regime / trend / volatility / action /
-              confidence）落库后，这里展示最近一次的 AI 分析结论与依据摘要。
-            </p>
-            <p className="mt-2 text-xs">
-              前端不会自己计算策略信号——所有 AI 判断都来自 Agent。
-            </p>
-          </CardContent>
-        </Card>
+        <AnalysisCard symbol={symbol} />
       </div>
     </div>
   );

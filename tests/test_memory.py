@@ -49,3 +49,27 @@ def test_blocked_decisions_are_recorded(tmp_path):
     )
     assert store.recent_decisions(1)[0]["outcome"].startswith("BLOCKED")
     store.close()
+
+
+def test_market_analysis_roundtrip(tmp_path):
+    store = MemoryStore(str(tmp_path / "mem.db"))
+    aid = store.record_analysis(
+        mode="PAPER",
+        symbol="BTC",
+        regime="ranging",
+        trend="sideways",
+        volatility="low",
+        action="WATCH",
+        strategy="grid",
+        confidence=0.65,
+        evidence="tight range, neutral funding",
+        raw='{"symbol": "BTC"}',
+    )
+    latest = store.latest_analysis("BTC")
+    assert len(latest) == 1
+    assert latest[0]["id"] == aid
+    assert latest[0]["regime"] == "ranging"
+    assert latest[0]["action"] == "WATCH"
+    assert store.latest_analysis("ETH") == []
+    assert len(store.latest_analysis()) == 1
+    store.close()

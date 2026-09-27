@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { usePriceStream } from "@/lib/use-price-stream";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
@@ -30,6 +31,7 @@ export function Topbar() {
     queryFn: api.health,
     refetchInterval: 15_000,
   });
+  const tick = usePriceStream();
 
   const mode = health.data?.mode ?? "…";
   const modeColor =
@@ -61,9 +63,21 @@ export function Topbar() {
           })}
         </div>
       </div>
-      <Badge variant="outline" className={cn("px-3 py-1 text-xs font-bold tracking-wider", modeColor)}>
-        {mode}
-      </Badge>
+      <div className="flex items-center gap-4">
+        {tick?.prices && (
+          <div className="hidden items-center gap-3 font-mono text-xs text-muted-foreground sm:flex">
+            <span>BTC <span className="text-foreground">{tick.prices["BTC-USD"]?.toLocaleString()}</span></span>
+            <span>ETH <span className="text-foreground">{tick.prices["ETH-USD"]?.toLocaleString()}</span></span>
+            <span className="relative flex h-1.5 w-1.5">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+            </span>
+          </div>
+        )}
+        <Badge variant="outline" className={cn("px-3 py-1 text-xs font-bold tracking-wider", modeColor)}>
+          {mode}
+        </Badge>
+      </div>
     </header>
   );
 }

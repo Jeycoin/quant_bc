@@ -15,7 +15,9 @@ interactive use does not pay the uvx startup cost on every message.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import shlex
 import sys
 from contextlib import AsyncExitStack
@@ -32,6 +34,21 @@ from integrations.llm import create_llm_client
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "trading_manager.md"
 MAX_TOOL_ROUNDS = 25
+
+_ANALYSIS_BLOCK = re.compile(r"```analysis\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def extract_analysis_blocks(text: str) -> list[dict[str, Any]]:
+    """Pull structured market-analysis blocks out of a final reply."""
+    blocks = []
+    for match in _ANALYSIS_BLOCK.finditer(text or ""):
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            blocks.append(data)
+    return blocks
 
 
 def _load_system_prompt(mode: str) -> str:
@@ -85,7 +102,21 @@ class TradingAgent:
         session, tools = await self._ensure_session()
         messages = list(history or [])
         messages.append({"role": "user", "content": user_message})
-        return await self._tool_loop(session, tools, messages)
+        answer = await self._tool_loop(session, tools, messages)
+        for block in extract_analysis_blocks(answer):
+            self.memory.record_analysis(
+                mode=self.guard.mode,
+                symbol=block.get("symbol"),
+                regime=block.get("regime"),
+                trend=block.get("trend"),
+                volatility=block.get("volatility"),
+                action=block.get("action"),
+                strategy=block.get("strategy"),
+                confidence=block.get("confidence"),
+                evidence=block.get("evidence"),
+                raw=json.dumps(block, ensure_ascii=False),
+            )
+        return answer
 
     async def _tool_loop(
         self,

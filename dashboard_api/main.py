@@ -11,25 +11,79 @@ behind the same URLs.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
 import sqlite3
-import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
+from dashboard_api.events import analysis_to_event, decision_to_event, review_to_event
 from dashboard_api.hummingbot import EndpointNotAllowed, ReadOnlyHummingbot
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
 MEMORY_DB = REPO_ROOT / "data" / "agent_memory.db"
+DASH_DB = REPO_ROOT / "data" / "dashboard.db"
 MARKET_PROBE_CONNECTOR = "hyperliquid_perpetual"
 MARKET_PROBE_PAIR = "BTC-USD"
+
+
+def _init_dash_db() -> None:
+    DASH_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DASH_DB)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS equity_snapshots (ts REAL NOT NULL, equity REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+
+_init_dash_db()
+
+# Ensure the agent memory schema is current (creates missing tables only;
+# MemoryStore is the single source of truth for the schema).
+from agent.memory.store import MemoryStore
+
+MemoryStore(str(MEMORY_DB)).close()
+
+
+def _record_equity_snapshot(equity: float, min_interval_s: int = 60) -> None:
+    conn = sqlite3.connect(DASH_DB)
+    row = conn.execute("SELECT MAX(ts) FROM equity_snapshots").fetchone()
+    now = time.time()
+    if not row[0] or now - row[0] >= min_interval_s:
+        conn.execute("INSERT INTO equity_snapshots (ts, equity) VALUES (?, ?)", (now, equity))
+        conn.commit()
+    conn.close()
+
+
+def _equity_stats(current: float) -> dict[str, Any]:
+    conn = sqlite3.connect(DASH_DB)
+    rows = conn.execute(
+        "SELECT ts, equity FROM equity_snapshots ORDER BY ts DESC LIMIT 500"
+    ).fetchall()
+    conn.close()
+    history = [{"ts": ts, "equity": eq} for ts, eq in reversed(rows)]
+    peak = max([current] + [p["equity"] for p in history])
+    drawdown_pct = (peak - current) / peak * 100 if peak else 0.0
+    return {"peak": peak, "drawdown_pct": drawdown_pct, "history": history}
+
+
+def _memory_rows(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    conn = sqlite3.connect(MEMORY_DB)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 app = FastAPI(title="AI Quant Dashboard API", version="0.1.0")
 app.add_middleware(
@@ -133,6 +187,8 @@ async def get_overview() -> dict[str, Any]:
                 })
 
     position_rows = positions.get("data", []) if isinstance(positions, dict) else []
+    _record_equity_snapshot(equity)
+    stats = _equity_stats(equity)
     return {
         "mode": trading_mode(),
         "equity": equity,
@@ -140,6 +196,9 @@ async def get_overview() -> dict[str, Any]:
         "executors": executors,
         "open_positions": position_rows,
         "open_position_count": len(position_rows),
+        "equity_history": stats["history"],
+        "peak_equity": stats["peak"],
+        "drawdown_pct": stats["drawdown_pct"],
     }
 
 
@@ -308,14 +367,138 @@ async def get_market(symbol: str = "BTC", interval: str = "1m", limit: int = 200
 async def get_decisions(limit: int = 50) -> dict[str, Any]:
     limit = max(1, min(limit, 200))
     try:
-        conn = sqlite3.connect(MEMORY_DB)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
+        rows = _memory_rows(
             "SELECT id, ts, mode, market_context, analysis, tool_name, tool_arguments, outcome"
             " FROM decisions ORDER BY id DESC LIMIT ?",
             (limit,),
-        ).fetchall()
-        conn.close()
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"memory db error: {exc}") from exc
-    return {"data": [dict(r) for r in rows]}
+    return {"data": rows}
+
+
+@app.get("/api/memory/reviews")
+async def get_reviews(limit: int = 50) -> dict[str, Any]:
+    limit = max(1, min(limit, 200))
+    return {"data": _memory_rows(
+        "SELECT id, ts, subject, review FROM trade_reviews ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )}
+
+
+@app.get("/api/memory/notes")
+async def get_notes(limit: int = 50) -> dict[str, Any]:
+    limit = max(1, min(limit, 200))
+    return {"data": _memory_rows(
+        "SELECT id, ts, topic, note FROM research_notes ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )}
+
+
+@app.get("/api/ai/analysis")
+async def get_ai_analysis(symbol: str | None = None, limit: int = 20) -> dict[str, Any]:
+    limit = max(1, min(limit, 100))
+    if symbol:
+        rows = _memory_rows(
+            "SELECT id, ts, mode, symbol, regime, trend, volatility, action, strategy,"
+            " confidence, evidence FROM market_analysis WHERE symbol = ?"
+            " ORDER BY id DESC LIMIT ?",
+            (symbol.upper(), limit),
+        )
+    else:
+        rows = _memory_rows(
+            "SELECT id, ts, mode, symbol, regime, trend, volatility, action, strategy,"
+            " confidence, evidence FROM market_analysis ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+    return {"data": rows}
+
+
+@app.get("/api/ai/timeline")
+async def get_ai_timeline(limit: int = 100) -> dict[str, Any]:
+    limit = max(1, min(limit, 300))
+    decisions = _memory_rows(
+        "SELECT id, ts, mode, tool_name, tool_arguments, outcome"
+        " FROM decisions ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    analyses = _memory_rows(
+        "SELECT id, ts, mode, symbol, regime, action, confidence"
+        " FROM market_analysis ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    reviews = _memory_rows(
+        "SELECT id, ts, subject FROM trade_reviews ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    events = (
+        [decision_to_event(r) for r in decisions]
+        + [analysis_to_event(r) for r in analyses]
+        + [review_to_event(r) for r in reviews]
+    )
+    events.sort(key=lambda e: e["ts"], reverse=True)
+    return {"data": events[:limit]}
+
+
+@app.get("/api/journal")
+async def get_journal(limit: int = 100) -> dict[str, Any]:
+    """Closed executors joined with trade reviews — the trade journal."""
+    result = await _hb_call("POST", "/executors/search", json={"limit": max(1, min(limit, 500))})
+    executors = result.get("data", []) if isinstance(result, dict) else []
+    reviews = _memory_rows("SELECT id, ts, subject, review FROM trade_reviews")
+
+    entries = []
+    for e in executors:
+        if not e.get("closed_at") and not e.get("close_timestamp"):
+            continue  # still running — journal is for completed trades
+        eid = e.get("executor_id", "")
+        review = next((r for r in reviews if eid in (r.get("subject") or "")), None)
+        created = e.get("created_at")
+        closed_ts = e.get("close_timestamp")
+        created_ts = None
+        if created:
+            from datetime import datetime
+            created_ts = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+        entries.append({
+            "executor_id": eid,
+            "symbol": e.get("trading_pair"),
+            "strategy": e.get("executor_type"),
+            "connector": e.get("connector_name"),
+            "opened_at": created,
+            "closed_at": e.get("closed_at"),
+            "duration_s": (closed_ts - created_ts) if closed_ts and created_ts else None,
+            "pnl_quote": e.get("net_pnl_quote"),
+            "pnl_pct": e.get("net_pnl_pct"),
+            "filled_amount_quote": e.get("filled_amount_quote"),
+            "fees_quote": e.get("cum_fees_quote"),
+            "close_type": e.get("close_type"),
+            "review": review.get("review") if review else None,
+            "memory_id": review.get("id") if review else None,
+        })
+    return {"data": entries}
+
+
+@app.get("/api/stream")
+async def stream_prices() -> StreamingResponse:
+    """SSE: BTC/ETH prices + funding every 5s. Pages still poll as fallback;
+    this endpoint is the seam for a future WebSocket upgrade."""
+
+    async def generate():
+        while True:
+            payload: dict[str, Any] = {"ts": time.time()}
+            try:
+                res = await hb.call("POST", "/market-data/prices", json={
+                    "connector_name": MARKET_PROBE_CONNECTOR,
+                    "trading_pairs": ["BTC-USD", "ETH-USD"],
+                })
+                payload["prices"] = res.get("prices", {})
+            except Exception as exc:
+                payload["error"] = str(exc)
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(5)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

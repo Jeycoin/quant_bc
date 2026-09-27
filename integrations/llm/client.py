@@ -23,7 +23,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-MAX_TOKENS = 4096
+MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
 
 
 @dataclass

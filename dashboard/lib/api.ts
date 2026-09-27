@@ -75,6 +75,9 @@ export type Overview = {
   executors: ExecutorSummary;
   open_positions: Position[];
   open_position_count: number;
+  equity_history: { ts: number; equity: number }[];
+  peak_equity: number;
+  drawdown_pct: number;
 };
 
 export type Decision = {
@@ -87,6 +90,51 @@ export type Decision = {
   tool_arguments: string;
   outcome: string | null;
 };
+
+export type TimelineEvent = {
+  id: number | string;
+  ts: number;
+  mode: string | null;
+  event_type: string;
+  symbol: string | null;
+  summary: string;
+  result: string;
+  source: string;
+};
+
+export type AiAnalysis = {
+  id: number;
+  ts: number;
+  mode: string;
+  symbol: string | null;
+  regime: string | null;
+  trend: string | null;
+  volatility: string | null;
+  action: string | null;
+  strategy: string | null;
+  confidence: number | null;
+  evidence: string | null;
+};
+
+export type JournalEntry = {
+  executor_id: string;
+  symbol: string;
+  strategy: string;
+  connector: string;
+  opened_at: string | null;
+  closed_at: string | null;
+  duration_s: number | null;
+  pnl_quote: number;
+  pnl_pct: number;
+  filled_amount_quote: number;
+  fees_quote: number;
+  close_type: string | null;
+  review: string | null;
+  memory_id: number | null;
+};
+
+export type Review = { id: number; ts: number; subject: string; review: string };
+export type Note = { id: number; ts: number; topic: string; note: string };
 
 export type Executor = {
   executor_id: string;
@@ -174,4 +222,12 @@ export const api = {
   executor: (id: string) => get<Executor>(`/api/executors/${id}`),
   market: (symbol: string, interval = "1m", limit = 200) =>
     get<MarketData>(`/api/market?symbol=${symbol}&interval=${interval}&limit=${limit}`),
+  timeline: (limit = 100) => get<{ data: TimelineEvent[] }>(`/api/ai/timeline?limit=${limit}`),
+  aiAnalysis: (symbol?: string) =>
+    get<{ data: AiAnalysis[] }>(`/api/ai/analysis${symbol ? `?symbol=${symbol}` : ""}`),
+  journal: () => get<{ data: JournalEntry[] }>("/api/journal"),
+  reviews: () => get<{ data: Review[] }>("/api/memory/reviews"),
+  notes: () => get<{ data: Note[] }>("/api/memory/notes"),
 };
+
+export const API_BASE_URL = API_BASE;

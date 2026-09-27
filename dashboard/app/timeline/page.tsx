@@ -1,15 +1,20 @@
-import { Placeholder } from "@/components/placeholder";
+import { Timeline } from "@/components/timeline";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 export default function TimelinePage() {
   return (
-    <Placeholder
-      title="AI Decision Timeline"
-      phase="Phase 5"
-      items={[
-        "MARKET_SCAN → ANALYSIS → STRATEGY_SELECTION → RISK_CHECK → EXECUTOR_CREATED → ORDER → FILL → POSITION → REVIEW",
-        "Structured decision summaries only — no chain-of-thought",
-        "Timestamp / symbol / event type / summary / result",
-      ]}
-    />
+    <Card className="bg-card/60">
+      <CardHeader>
+        <CardTitle className="text-sm">
+          AI Decision Timeline
+          <span className="ml-2 text-xs font-normal text-muted-foreground">
+            structured decision summaries only — no chain-of-thought
+          </span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <Timeline limit={100} />
+      </CardContent>
+    </Card>
   );
 }
