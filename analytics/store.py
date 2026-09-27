@@ -111,6 +111,19 @@ class AnalyticsStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path)
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive-only migrations. Existing experiments stay untouched;
+        older rows simply have NULL in the new columns."""
+        trade_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(trade_events)")}
+        for col in ("gross_pnl", "entry_fee", "exit_fee", "slippage_quote"):
+            if col not in trade_cols:
+                self._conn.execute(f"ALTER TABLE trade_events ADD COLUMN {col} REAL")
+        decision_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(decision_events)")}
+        if "rejection_reason" not in decision_cols:
+            self._conn.execute("ALTER TABLE decision_events ADD COLUMN rejection_reason TEXT")
+        self._conn.commit()
 
     # ------------------------------------------------------------- decisions
 
@@ -135,6 +148,7 @@ class AnalyticsStore:
         prompt_version: str | None = None,
         config_version: str | None = None,
         experiment_id: str | None = None,
+        rejection_reason: str | None = None,
         ts: float | None = None,
     ) -> str:
         did = decision_id or new_decision_id()
@@ -143,8 +157,9 @@ class AnalyticsStore:
             " (decision_id, ts, mode, symbol, market_regime, action, strategy,"
             " confidence, evidence, risk_status, tool_name, tool_arguments,"
             " outcome_status, execution_id, market_context, portfolio_context,"
-            " agent_version, prompt_version, config_version, experiment_id)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " agent_version, prompt_version, config_version, experiment_id,"
+            " rejection_reason)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 did, ts if ts is not None else time.time(), mode, symbol,
                 market_regime, action, strategy, confidence, evidence,
@@ -153,6 +168,7 @@ class AnalyticsStore:
                 json.dumps(market_context or {}, ensure_ascii=False),
                 json.dumps(portfolio_context or {}, ensure_ascii=False),
                 agent_version, prompt_version, config_version, experiment_id,
+                rejection_reason,
             ),
         )
         self._conn.commit()
@@ -191,6 +207,10 @@ class AnalyticsStore:
         pnl_pct: float | None = None,
         filled_amount_quote: float | None = None,
         fees_quote: float | None = None,
+        gross_pnl: float | None = None,
+        entry_fee: float | None = None,
+        exit_fee: float | None = None,
+        slippage_quote: float | None = None,
         regime_at_entry: str | None = None,
         source: str | None = None,
         experiment_id: str | None = None,
@@ -199,14 +219,14 @@ class AnalyticsStore:
             "INSERT OR REPLACE INTO trade_events"
             " (executor_id, decision_id, ts_open, ts_close, symbol, strategy,"
             " connector, side, status, close_type, pnl_quote, pnl_pct,"
-            " filled_amount_quote, fees_quote, regime_at_entry, source,"
-            " experiment_id)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " filled_amount_quote, fees_quote, gross_pnl, entry_fee, exit_fee,"
+            " slippage_quote, regime_at_entry, source, experiment_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 executor_id, decision_id, ts_open, ts_close, symbol, strategy,
                 connector, side, status, close_type, pnl_quote, pnl_pct,
-                filled_amount_quote, fees_quote, regime_at_entry, source,
-                experiment_id,
+                filled_amount_quote, fees_quote, gross_pnl, entry_fee, exit_fee,
+                slippage_quote, regime_at_entry, source, experiment_id,
             ),
         )
         self._conn.commit()

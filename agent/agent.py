@@ -30,6 +30,14 @@ from mcp.client.stdio import stdio_client
 
 from agent.memory.store import MemoryStore
 from agent.safety import SafetyGuard, SafetyViolation
+from agent.validators import (
+    GRID_DEFENSIVE,
+    GRID_EXIT,
+    CostValidator,
+    RiskValidator,
+    compute_grid_features,
+    evaluate_grid_state,
+)
 from analytics.store import AnalyticsStore, new_decision_id
 from analytics.versioning import current_versions
 from integrations.llm import create_llm_client
@@ -43,7 +51,7 @@ _EXECUTOR_ID = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,48}")
 
 _STANDARD_REGIMES = {
     "TRENDING_BULL", "TRENDING_BEAR", "RANGING", "HIGH_VOLATILITY",
-    "LOW_VOLATILITY", "BREAKOUT", "UNCERTAIN",
+    "LOW_VOLATILITY", "BREAKOUT", "UNCERTAIN", "REGIME_TRANSITION",
 }
 _REGIME_ALIASES = {
     "TRENDING_UP": "TRENDING_BULL",
@@ -127,6 +135,10 @@ class TradingAgent:
         # Set when a memory write fails — degraded mode: no new trades
         # (master prompt §28: never trade freely when memory is down).
         self._memory_broken = False
+        # Deterministic validation gates (v0.4): the LLM proposes, these
+        # approve. Fail-closed on missing economics data.
+        self.cost_validator = CostValidator.from_config(guard.config)
+        self.risk_validator = RiskValidator.from_config(guard.config)
 
     def _safe_record(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         """Memory writes are best-effort; a failure flips degraded mode."""
@@ -369,6 +381,22 @@ class TradingAgent:
             )
             return f"SAFETY VIOLATION — call rejected: {exc}"
 
+        if name == "manage_executors" and arguments.get("action") == "create":
+            rejection, stage = await self._validate_executor_create(arguments)
+            if rejection:
+                self._blocked = True
+                self._safe_record(
+                    self.memory.record_decision,
+                    mode=self.guard.mode,
+                    market_context="",
+                    analysis="",
+                    tool_name=name,
+                    tool_arguments=arguments,
+                    outcome=f"BLOCKED[{stage}]: {rejection}",
+                )
+                self._record_rejection(arguments, stage, rejection)
+                return rejection
+
         result = await session.call_tool(name, arguments)
         text = "\n".join(
             getattr(part, "text", str(part)) for part in result.content
@@ -392,6 +420,222 @@ class TradingAgent:
             outcome="ERROR: " + text if result.is_error else "OK",
         )
         return text
+
+    async def _validate_executor_create(
+        self, arguments: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        """Deterministic gates before any executor is created.
+
+        Order: grid protection -> cost -> risk. Returns
+        (rejection_message, stage) or (None, None) when all gates pass.
+        """
+        cfg = arguments.get("executor_config", {}) or {}
+        etype = str(cfg.get("type", ""))
+        pair = str(cfg.get("trading_pair", ""))
+        symbol = pair.partition("-")[0] or None
+
+        # 1. Grid protection: objective candle features; blocks only on
+        #    DEFENSIVE/EXIT (WARNING is logged via the rejection-free path).
+        if "grid" in etype:
+            state = await self._grid_state(cfg)
+            if state is not None and state.state in (GRID_DEFENSIVE, GRID_EXIT):
+                return (
+                    f"GRID PROTECTION — {state.state}: {'; '.join(state.reasons)}. "
+                    "New grid exposure is disabled in this state.",
+                    "GRID_REJECTED",
+                )
+
+        # 2. Cost validator: positive expected economics after fees,
+        #    slippage and safety margin. Fails closed when the notional
+        #    cannot be determined (no economics data -> no trade).
+        report = await self._cost_check(etype, cfg)
+        if report is None:
+            return (
+                "COST VALIDATOR — REJECTED: could not determine trade notional "
+                "or take-profit from the executor config / market data.",
+                "COST_REJECTED",
+            )
+        if not report.approved:
+            return f"COST VALIDATOR — {report.summary()}", "COST_REJECTED"
+
+        # 3. Risk validator: portfolio-level exposure limits.
+        exposure = await self._current_exposure()
+        total_exposure = sum(exposure.values()) if isinstance(exposure, dict) else 0.0
+        symbol_exposure = (exposure.get(symbol, 0.0)
+                           if isinstance(exposure, dict) and symbol else 0.0)
+        new_exposure = await self._config_exposure(etype, cfg)
+        risk = self.risk_validator.validate(
+            symbol=symbol,
+            new_exposure_quote=new_exposure or 0.0,
+            current_exposure_quote=total_exposure,
+            symbol_exposure_quote=symbol_exposure,
+        )
+        if not risk.approved:
+            return "RISK VALIDATOR — REJECTED: " + "; ".join(risk.reasons), \
+                "RISK_REJECTED"
+        return None, None
+
+    async def _grid_state(self, cfg: dict[str, Any]):
+        """Evaluate the grid protection state from objective 1h candles.
+
+        Market data comes from the hyperliquid probe connector (the only
+        reachable market-data source in this deployment). Returns None when
+        data is unavailable — fail open, the cost/risk gates still apply.
+        """
+        pair = str(cfg.get("trading_pair", ""))
+        base = pair.partition("-")[0]
+        if not base:
+            return None
+        try:
+            data = await self._hb_rest("POST", "/market-data/candles", {
+                "connector_name": os.getenv("MARKET_PROBE_CONNECTOR",
+                                            "hyperliquid_perpetual"),
+                "trading_pair": f"{base}-USD",
+                "interval": "1h",
+                "max_records": 100,
+            })
+            rows = data.get("candles", data) if isinstance(data, dict) else data
+            candles = [
+                {"high": float(c["high"]), "low": float(c["low"]),
+                 "close": float(c["close"])}
+                for c in (rows or [])
+            ]
+            features = compute_grid_features(candles)
+            if not features:
+                return None
+            return evaluate_grid_state(features, config=self.guard.config)
+        except Exception:
+            return None
+
+    async def _cost_check(self, etype: str, cfg: dict[str, Any]):
+        """Run the cost validator for a grid/position executor config."""
+        if "grid" in etype:
+            amount = cfg.get("total_amount_quote")
+            tp = cfg.get("take_profit")
+            if amount is None or tp is None:
+                return None
+            maker_entry = int(cfg.get("order_type", 3)) == 3  # 3 = LIMIT
+            maker_exit = int(cfg.get("take_profit_order_type", 3)) == 3
+            return self.cost_validator.validate_grid(
+                float(amount), float(tp),
+                max_open_orders=cfg.get("max_open_orders"),
+                maker_entry=maker_entry, maker_exit=maker_exit,
+            )
+        # position executor: notional = base amount * current price
+        amount = cfg.get("amount")
+        barrier = cfg.get("triple_barrier_config", {}) or {}
+        tp = barrier.get("take_profit")
+        if amount is None or tp is None:
+            return None
+        price = await self._current_price(cfg)
+        if not price:
+            return None
+        return self.cost_validator.validate_position(
+            float(amount) * price, float(tp)
+        )
+
+    async def _current_price(self, cfg: dict[str, Any]) -> float | None:
+        connector = str(cfg.get("connector_name", ""))
+        pair = str(cfg.get("trading_pair", ""))
+        candidates = [(connector, pair)]
+        base = pair.partition("-")[0]
+        if base:
+            candidates.append((os.getenv("MARKET_PROBE_CONNECTOR",
+                                         "hyperliquid_perpetual"),
+                               f"{base}-USD"))
+        for conn, p in candidates:
+            if not conn or not p:
+                continue
+            try:
+                data = await self._hb_rest("POST", "/market-data/prices", {
+                    "connector_name": conn, "trading_pairs": [p],
+                })
+                prices = data.get("prices", data) if isinstance(data, dict) else {}
+                if prices.get(p):
+                    return float(prices[p])
+            except Exception:
+                continue
+        return None
+
+    async def _config_exposure(self, etype: str, cfg: dict[str, Any]) -> float | None:
+        if "grid" in etype:
+            amount = cfg.get("total_amount_quote")
+            return float(amount) if amount is not None else None
+        amount = cfg.get("amount")
+        price = await self._current_price(cfg)
+        if amount is None or not price:
+            return None
+        return float(amount) * price
+
+    async def _current_exposure(self) -> dict[str, float] | None:
+        """Per-symbol quote exposure of RUNNING executors, from their
+        configs. None = unknown (monitoring outage -> fail open; the hard
+        executor-count cap in _check_position_capacity still applies)."""
+        try:
+            from hummingbot_api_client import HummingbotAPIClient
+
+            client = HummingbotAPIClient(
+                base_url=os.getenv("HUMMINGBOT_API_URL", "http://127.0.0.1:8100"),
+                username=os.getenv("HUMMINGBOT_USERNAME", "admin"),
+                password=os.getenv("HUMMINGBOT_PASSWORD", "admin"),
+            )
+            await client.init()
+            try:
+                result = await client.executors.search_executors(status="RUNNING")
+            finally:
+                await client.close()
+            rows = result.get("executors", result.get("data", [])) \
+                if isinstance(result, dict) else result
+            exposure: dict[str, float] = {}
+            for ex in rows or []:
+                cfg = ex.get("config", {}) or {}
+                sym = str(cfg.get("trading_pair", "")).partition("-")[0]
+                amount = cfg.get("total_amount_quote")
+                if sym and amount is not None:
+                    exposure[sym] = exposure.get(sym, 0.0) + float(amount)
+            return exposure
+        except Exception:
+            return None
+
+    def _record_rejection(
+        self, arguments: dict[str, Any], stage: str, message: str
+    ) -> None:
+        """Persist rejected proposals — rejected opportunities are a core
+        analytics surface (Dashboard 'Rejected Opportunities')."""
+        if self.analytics is None:
+            return
+        try:
+            cfg = arguments.get("executor_config", {}) or {}
+            etype = str(cfg.get("type", ""))
+            experiment = self.analytics.get_active_experiment()
+            self.analytics.record_decision_event(
+                mode=self.guard.mode,
+                symbol=str(cfg.get("trading_pair", "")).partition("-")[0] or None,
+                action="PROPOSE_GRID" if "grid" in etype else "PROPOSE_POSITION",
+                strategy="grid" if "grid" in etype else "position",
+                risk_status=stage,
+                tool_name="manage_executors",
+                tool_arguments=arguments,
+                outcome_status="REJECTED",
+                rejection_reason=message[:500],
+                experiment_id=experiment["experiment_id"] if experiment else None,
+                **self.versions,
+            )
+        except Exception:
+            pass  # analytics must never break the trading path
+
+    async def _hb_rest(self, method: str, path: str, payload: dict[str, Any]) -> Any:
+        import httpx
+
+        base = os.getenv("HUMMINGBOT_API_URL", "http://127.0.0.1:8100").rstrip("/")
+        auth = (
+            os.getenv("HUMMINGBOT_USERNAME", "admin"),
+            os.getenv("HUMMINGBOT_PASSWORD", "admin"),
+        )
+        async with httpx.AsyncClient(base_url=base, auth=auth, timeout=10.0) as client:
+            response = await client.request(method, path, json=payload)
+            response.raise_for_status()
+            return response.json()
 
     async def _check_position_capacity(self, name: str, arguments: dict[str, Any]) -> None:
         """Enforce max_open_positions before creating a new executor."""

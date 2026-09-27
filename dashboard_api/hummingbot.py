@@ -47,6 +47,16 @@ class ReadOnlyHummingbot:
             os.getenv("HUMMINGBOT_USERNAME", "admin"),
             os.getenv("HUMMINGBOT_PASSWORD", "admin"),
         )
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        # A fresh TCP connect from Windows to the WSL2-forwarded port costs
+        # ~1-2s, so keep one long-lived client and reuse its connections.
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=self.base, auth=self._auth, timeout=25.0
+            )
+        return self._client
 
     async def call(self, method: str, path: str, **kwargs: Any) -> Any:
         if (method, path) not in READ_ENDPOINTS:
@@ -54,9 +64,12 @@ class ReadOnlyHummingbot:
                 f"{method} {path} is not in the dashboard read whitelist"
             )
         url = path.format(**kwargs.pop("path_params", {}))
-        async with httpx.AsyncClient(
-            base_url=self.base, auth=self._auth, timeout=25.0
-        ) as client:
-            response = await client.request(method, url, **kwargs)
-            response.raise_for_status()
-            return response.json()
+        try:
+            response = await self._get_client().request(method, url, **kwargs)
+        except httpx.TransportError:
+            # Stale connection (e.g. Hummingbot restarted): rebuild and retry once.
+            await self._get_client().aclose()
+            self._client = None
+            response = await self._get_client().request(method, url, **kwargs)
+        response.raise_for_status()
+        return response.json()

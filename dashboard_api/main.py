@@ -181,9 +181,11 @@ async def get_health() -> dict[str, Any]:
 @app.get("/api/overview")
 async def get_overview() -> dict[str, Any]:
     try:
-        portfolio = await hb.call("POST", "/portfolio/state", json={})
-        executors = await hb.call("GET", "/executors/summary")
-        positions = await hb.call("POST", "/trading/positions", json={})
+        portfolio, executors, positions = await asyncio.gather(
+            hb.call("POST", "/portfolio/state", json={}),
+            hb.call("GET", "/executors/summary"),
+            hb.call("POST", "/trading/positions", json={}),
+        )
     except EndpointNotAllowed as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:

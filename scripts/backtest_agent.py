@@ -40,6 +40,15 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 load_dotenv(REPO_ROOT / ".env")
 
 from agent.agent import extract_analysis_blocks, normalize_regime
+from agent.validators import (
+    GRID_DEFENSIVE,
+    GRID_EXIT,
+    GRID_WARNING,
+    CostValidator,
+    RiskValidator,
+    compute_grid_features,
+    evaluate_grid_state,
+)
 from analytics.store import AnalyticsStore, new_decision_id
 from analytics.versioning import current_versions
 from backtest_grid import FEE_RATE, GridSim, fetch_candles
@@ -80,7 +89,8 @@ class SimPosition:
     executor_id: str
     regime_at_entry: str | None
 
-    def check_exit(self, c: dict, ts: float) -> tuple[float, str] | None:
+    def check_exit(self, c: dict, ts: float) -> tuple[float, str, float] | None:
+        """Returns (net_pnl, reason, total_fees) or None."""
         high, low, close = float(c["high"]), float(c["low"]), float(c["close"])
         tp = self.entry * (1 + POS_TP_PCT) if self.side == "LONG" else self.entry * (1 - POS_TP_PCT)
         sl = self.entry * (1 - POS_SL_PCT) if self.side == "LONG" else self.entry * (1 + POS_SL_PCT)
@@ -101,7 +111,7 @@ class SimPosition:
             return None
         gross = (exit_price - self.entry) * self.qty * sign
         fees = (self.entry + exit_price) * self.qty * FEE_RATE
-        return gross - fees, reason
+        return gross - fees, reason, fees
 
 
 @dataclass
@@ -171,6 +181,11 @@ async def main() -> None:
     llm = create_llm_client()
     store = AnalyticsStore(str(REPO_ROOT / "data" / "analytics.db"))
     versions = current_versions()
+    import yaml
+    with open(REPO_ROOT / "config" / "settings.yaml", "r", encoding="utf-8") as fh:
+        settings = yaml.safe_load(fh)
+    cost_validator = CostValidator.from_config(settings)
+    risk_validator = RiskValidator.from_config(settings)
     exp_id = store.start_experiment(
         name=f"bt-replay-{args.days}d",
         symbols=SYMBOLS,
@@ -203,13 +218,15 @@ async def main() -> None:
                 continue
             result = pos.check_exit(c, ts)
             if result:
-                pnl, reason = result
+                pnl, reason, fees = result
                 cash += POSITION_SIZE + pnl
                 positions.remove(pos)
                 store.upsert_trade_event(
                     executor_id=pos.executor_id, ts_open=pos.opened_ts, ts_close=ts,
                     symbol=pos.symbol, strategy="position_executor", side=pos.side,
                     status="CLOSED", close_type=reason, pnl_quote=pnl,
+                    gross_pnl=pnl + fees, fees_quote=fees,
+                    entry_fee=fees / 2, exit_fee=fees / 2,
                     regime_at_entry=pos.regime_at_entry, source="agent",
                     experiment_id=exp_id)
         for sym, g in list(grids.items()):
@@ -278,43 +295,91 @@ async def main() -> None:
             conf = float(block.get("confidence") or 0)
             price = px.get(sym) or summaries[sym]["price"]
             execution_id = None
+            risk_status = "PASSED"
+            rejection_reason = None
 
-            # deterministic execution policy
+            # objective features for the grid protection state machine
+            sym_candles = [c for c in candles[sym] if c["timestamp"] <= ts][-120:]
+            grid_state = evaluate_grid_state(
+                compute_grid_features(sym_candles), regime=regime, config=settings)
+
+            # deterministic execution policy — proposals pass through the
+            # same cost/risk/protection gates as the live path (v0.4)
             if block.get("strategy") == "grid" and regime == "RANGING" and sym not in grids:
-                execution_id = f"bt-grid-{sym}-{int(ts)}"
-                grids[sym] = SimGrid(
-                    GridSim(price * (1 - GRID_RANGE_PCT), price * (1 + GRID_RANGE_PCT),
-                            GRID_SIZE, tp=GRID_TP),
-                    sym, ts, execution_id, regime)
-                cash -= GRID_SIZE
-                trade_count += 1
-            elif block.get("strategy") != "grid" and sym in grids:
+                rejection = None
+                if grid_state.state in (GRID_DEFENSIVE, GRID_EXIT):
+                    rejection = ("GRID_REJECTED",
+                                 f"{grid_state.state}: {'; '.join(grid_state.reasons)}")
+                else:
+                    cost = cost_validator.validate_grid(GRID_SIZE, GRID_TP,
+                                                        maker_entry=True, maker_exit=True)
+                    if not cost.approved:
+                        rejection = ("COST_REJECTED", cost.summary())
+                if rejection is None:
+                    risk = risk_validator.validate(
+                        symbol=sym, new_exposure_quote=GRID_SIZE,
+                        current_exposure_quote=GRID_SIZE * len(grids)
+                        + POSITION_SIZE * len(positions),
+                        symbol_exposure_quote=0.0)
+                    if not risk.approved:
+                        rejection = ("RISK_REJECTED", "; ".join(risk.reasons))
+                if rejection:
+                    risk_status, rejection_reason = rejection
+                else:
+                    execution_id = f"bt-grid-{sym}-{int(ts)}"
+                    grids[sym] = SimGrid(
+                        GridSim(price * (1 - GRID_RANGE_PCT), price * (1 + GRID_RANGE_PCT),
+                                GRID_SIZE, tp=GRID_TP),
+                        sym, ts, execution_id, regime)
+                    cash -= GRID_SIZE
+                    trade_count += 1
+            elif (block.get("strategy") != "grid" and sym in grids) \
+                    or (sym in grids and grid_state.state == GRID_EXIT):
+                # regime-based exit (LLM) or deterministic protection exit
+                close_type = "GRID_PROTECTION_EXIT" \
+                    if sym in grids and grid_state.state == GRID_EXIT else "REGIME_EXIT"
                 g = grids.pop(sym)
                 cash += g.sim.equity(price)
                 closed_pnl = g.sim.equity(price) - GRID_SIZE
                 store.upsert_trade_event(
                     executor_id=g.executor_id, ts_open=g.opened_ts, ts_close=ts,
                     symbol=sym, strategy="grid_executor", status="CLOSED",
-                    close_type="REGIME_EXIT", pnl_quote=closed_pnl,
-                    fees_quote=g.sim.fees, regime_at_entry=g.regime_at_entry,
+                    close_type=close_type, pnl_quote=closed_pnl,
+                    fees_quote=g.sim.fees, gross_pnl=closed_pnl + g.sim.fees,
+                    regime_at_entry=g.regime_at_entry,
                     source="agent", experiment_id=exp_id)
             if action in ("LONG", "SHORT") and conf >= MIN_CONFIDENCE \
                     and not any(p.symbol == sym for p in positions) and cash >= POSITION_SIZE:
-                execution_id = f"bt-pos-{sym}-{int(ts)}"
-                positions.append(SimPosition(
-                    sym, action, price, POSITION_SIZE / price,
-                    ts + POS_TIME_LIMIT_S, ts, execution_id, regime))
-                cash -= POSITION_SIZE
-                trade_count += 1
+                cost = cost_validator.validate_position(POSITION_SIZE, POS_TP_PCT)
+                if not cost.approved:
+                    risk_status, rejection_reason = "COST_REJECTED", cost.summary()
+                else:
+                    risk = risk_validator.validate(
+                        symbol=sym, new_exposure_quote=POSITION_SIZE,
+                        current_exposure_quote=GRID_SIZE * len(grids)
+                        + POSITION_SIZE * len(positions),
+                        symbol_exposure_quote=POSITION_SIZE *
+                        sum(1 for p in positions if p.symbol == sym))
+                    if not risk.approved:
+                        risk_status, rejection_reason = "RISK_REJECTED", "; ".join(risk.reasons)
+                    else:
+                        execution_id = f"bt-pos-{sym}-{int(ts)}"
+                        positions.append(SimPosition(
+                            sym, action, price, POSITION_SIZE / price,
+                            ts + POS_TIME_LIMIT_S, ts, execution_id, regime))
+                        cash -= POSITION_SIZE
+                        trade_count += 1
 
             store.record_decision_event(
                 decision_id=decision_id if sym == SYMBOLS[0] else new_decision_id(),
                 ts=float(ts), mode="BACKTEST", symbol=sym, market_regime=regime,
                 action=action, strategy=block.get("strategy"), confidence=conf,
-                evidence=block.get("evidence"), risk_status="PASSED",
-                outcome_status="EXECUTED" if execution_id else "RECORDED",
+                evidence=block.get("evidence"), risk_status=risk_status,
+                outcome_status="EXECUTED" if execution_id else
+                ("REJECTED" if rejection_reason else "RECORDED"),
                 execution_id=execution_id, market_context=context["markets"].get(sym),
                 portfolio_context=context["portfolio"], experiment_id=exp_id,
+                rejection_reason=rejection_reason,
                 **versions)
         print(f"  [{time.strftime('%m-%d %H:%M', time.gmtime(ts))}] "
               + " ".join(f"{b.get('symbol')}:{b.get('action')}/{b.get('regime')}"
@@ -325,21 +390,26 @@ async def main() -> None:
     for pos in list(positions):
         price = px[pos.symbol]
         sign = 1 if pos.side == "LONG" else -1
-        pnl = (price - pos.entry) * pos.qty * sign - (pos.entry + price) * pos.qty * FEE_RATE
+        fees = (pos.entry + price) * pos.qty * FEE_RATE
+        pnl = (price - pos.entry) * pos.qty * sign - fees
         cash += POSITION_SIZE + pnl
         store.upsert_trade_event(
             executor_id=pos.executor_id, ts_open=pos.opened_ts, ts_close=last_ts,
             symbol=pos.symbol, strategy="position_executor", side=pos.side,
             status="CLOSED", close_type="REPLAY_END", pnl_quote=pnl,
+            gross_pnl=pnl + fees, fees_quote=fees,
+            entry_fee=fees / 2, exit_fee=fees / 2,
             regime_at_entry=pos.regime_at_entry, source="agent", experiment_id=exp_id)
     for sym, g in list(grids.items()):
         price = px[sym]
         cash += g.sim.equity(price)
+        grid_pnl = g.sim.equity(price) - GRID_SIZE
         store.upsert_trade_event(
             executor_id=g.executor_id, ts_open=g.opened_ts, ts_close=last_ts,
             symbol=sym, strategy="grid_executor", status="CLOSED",
-            close_type="REPLAY_END", pnl_quote=g.sim.equity(price) - GRID_SIZE,
-            fees_quote=g.sim.fees, regime_at_entry=g.regime_at_entry,
+            close_type="REPLAY_END", pnl_quote=grid_pnl,
+            fees_quote=g.sim.fees, gross_pnl=grid_pnl + g.sim.fees,
+            regime_at_entry=g.regime_at_entry,
             source="agent", experiment_id=exp_id)
 
     # baselines over the same window: fixed grid per symbol + buy&hold
