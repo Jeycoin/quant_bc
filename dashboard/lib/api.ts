@@ -88,6 +88,42 @@ export type Decision = {
   outcome: string | null;
 };
 
+export type Executor = {
+  executor_id: string;
+  executor_type: string;
+  account_name: string;
+  connector_name: string;
+  trading_pair: string;
+  side: string | null;
+  status: string;
+  close_type: string | null;
+  is_active: boolean;
+  is_trading: boolean;
+  created_at: string;
+  closed_at?: string | null;
+  close_timestamp?: number | null;
+  controller_id: string;
+  net_pnl_quote: number;
+  net_pnl_pct: number;
+  cum_fees_quote: number;
+  filled_amount_quote: number;
+  error_count?: number;
+  last_error?: string | null;
+  config?: Record<string, unknown>;
+  grid_info?: GridInfo | null;
+};
+
+export type GridInfo = {
+  start_price: number;
+  end_price: number;
+  limit_price: number | null;
+  total_amount_quote: number | null;
+  take_profit_per_level: number;
+  level_count: number;
+  level_prices: number[];
+  indicative: boolean;
+};
+
 export const api = {
   mode: () => get<{ mode: string; live_trading_env: boolean; note: string }>("/api/mode"),
   health: () => get<Health>("/api/health"),
@@ -99,4 +135,7 @@ export const api = {
     ),
   activeOrders: () => get<{ data: Order[] }>("/api/orders/active"),
   positions: () => get<{ data: Position[] }>("/api/positions"),
+  executors: (status?: string) =>
+    get<{ data: Executor[] }>(`/api/executors${status ? `?status=${status}` : ""}`),
+  executor: (id: string) => get<Executor>(`/api/executors/${id}`),
 };

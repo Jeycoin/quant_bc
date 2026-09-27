@@ -205,6 +205,53 @@ async def get_positions() -> dict[str, Any]:
     return {"data": rows}
 
 
+@app.get("/api/executors")
+async def get_executors(status: str | None = None, limit: int = 100) -> dict[str, Any]:
+    payload: dict[str, Any] = {"limit": max(1, min(limit, 500))}
+    if status:
+        payload["status"] = status
+    return await _hb_call("POST", "/executors/search", json=payload)
+
+
+def _grid_info(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Derive indicative grid levels from a grid executor config.
+
+    Hummingbot spaces grid levels geometrically by the per-level
+    take_profit step. Live per-level state only exists on a running
+    executor; this is the configured (indicative) layout.
+    """
+    start = config.get("start_price")
+    end = config.get("end_price")
+    if not start or not end:
+        return None
+    tp = (config.get("triple_barrier_config") or {}).get("take_profit") or 0.0002
+    levels: list[float] = []
+    price = float(start)
+    while price <= float(end) and len(levels) < 500:
+        levels.append(round(price, 8))
+        price *= 1 + float(tp)
+    return {
+        "start_price": start,
+        "end_price": end,
+        "limit_price": config.get("limit_price"),
+        "total_amount_quote": config.get("total_amount_quote"),
+        "take_profit_per_level": tp,
+        "level_count": len(levels),
+        "level_prices": levels[:100],
+        "indicative": True,
+    }
+
+
+@app.get("/api/executors/{executor_id}")
+async def get_executor_detail(executor_id: str) -> dict[str, Any]:
+    detail = await _hb_call(
+        "GET", "/executors/{executor_id}", path_params={"executor_id": executor_id}
+    )
+    if isinstance(detail, dict) and detail.get("executor_type") == "grid_executor":
+        detail["grid_info"] = _grid_info(detail.get("config") or {})
+    return detail
+
+
 @app.get("/api/memory/decisions")
 async def get_decisions(limit: int = 50) -> dict[str, Any]:
     limit = max(1, min(limit, 200))
