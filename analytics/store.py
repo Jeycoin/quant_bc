@@ -253,15 +253,16 @@ class AnalyticsStore:
         config_snapshot: dict[str, Any] | None = None,
         notes: str | None = None,
         experiment_id: str | None = None,
+        status: str = "running",
     ) -> str:
         eid = experiment_id or f"exp-{uuid.uuid4().hex[:12]}"
         self._conn.execute(
             "INSERT INTO experiments"
             " (experiment_id, name, status, started_at, symbols, strategies,"
             " agent_version, prompt_version, config_version, config_snapshot,"
-            " notes) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+            " notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                eid, name, time.time(),
+                eid, name, status, time.time(),
                 json.dumps(symbols or []), json.dumps(strategies or []),
                 agent_version, prompt_version, config_version,
                 json.dumps(config_snapshot or {}, ensure_ascii=False), notes,

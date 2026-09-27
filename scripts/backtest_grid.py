@@ -69,55 +69,69 @@ async def fetch_candles(coin: str, days: int) -> list[dict]:
     return [candles[k] for k in sorted(candles)]
 
 
-def run_grid(candles: list[dict], start: float, end: float, amount: float,
-             tp: float = 0.0002, max_orders: int = 12) -> dict:
-    levels: list[float] = []
-    p = start
-    while p <= end and len(levels) < 2000:
-        levels.append(p)
-        p *= 1 + tp
-    per_level = amount / min(max_orders, len(levels))
-    cash = amount
-    bought_at: dict[int, float] = {}  # level idx -> qty held
-    trades: list[float] = []
-    fees = 0.0
+class GridSim:
+    """Incremental geometric-grid simulator shared by the batch backtester
+    and the agent replay harness. Candle-range touch fills, flat fees."""
 
-    for c in candles:
+    def __init__(self, start: float, end: float, amount: float,
+                 tp: float = 0.0002, max_orders: int = 12):
+        self.levels: list[float] = []
+        p = start
+        while p <= end and len(self.levels) < 2000:
+            self.levels.append(p)
+            p *= 1 + tp
+        self.tp = tp
+        self.per_level = amount / min(max_orders, len(self.levels))
+        self.max_orders = max_orders
+        self.cash = amount
+        self.bought_at: dict[int, float] = {}  # level idx -> qty held
+        self.trades: list[float] = []
+        self.fees = 0.0
+
+    def process_candle(self, c: dict) -> None:
         high, low = float(c["high"]), float(c["low"])
-        # sells first: candle traded up through the level's take-profit
-        for i in list(bought_at):
-            sell_price = levels[i] * (1 + tp)
+        for i in list(self.bought_at):
+            sell_price = self.levels[i] * (1 + self.tp)
             if high >= sell_price:
-                qty = bought_at.pop(i)
+                qty = self.bought_at.pop(i)
                 proceeds = qty * sell_price
                 sell_fee = proceeds * FEE_RATE
-                buy_cost = per_level + per_level * FEE_RATE
-                fees += sell_fee
-                cash += proceeds - sell_fee
-                trades.append(proceeds - sell_fee - buy_cost)
-        # buys: candle range touched the level, capacity and cash allow
-        for i, level in enumerate(levels):
-            if i in bought_at or len(bought_at) >= max_orders:
+                buy_cost = self.per_level + self.per_level * FEE_RATE
+                self.fees += sell_fee
+                self.cash += proceeds - sell_fee
+                self.trades.append(proceeds - sell_fee - buy_cost)
+        for i, level in enumerate(self.levels):
+            if i in self.bought_at or len(self.bought_at) >= self.max_orders:
                 continue
             if low <= level <= high:
-                buy_fee = per_level * FEE_RATE
-                if cash < per_level + buy_fee:
+                buy_fee = self.per_level * FEE_RATE
+                if self.cash < self.per_level + buy_fee:
                     continue
-                cash -= per_level + buy_fee
-                fees += buy_fee
-                bought_at[i] = per_level / level
+                self.cash -= self.per_level + buy_fee
+                self.fees += buy_fee
+                self.bought_at[i] = self.per_level / level
+
+    def equity(self, price: float) -> float:
+        return self.cash + sum(qty * price for qty in self.bought_at.values())
+
+
+def run_grid(candles: list[dict], start: float, end: float, amount: float,
+             tp: float = 0.0002, max_orders: int = 12) -> dict:
+    sim = GridSim(start, end, amount, tp, max_orders)
+    for c in candles:
+        sim.process_candle(c)
 
     last = float(candles[-1]["close"])
-    open_value = sum(qty * last for qty in bought_at.values())
-    equity = cash + open_value
-    wins = [t for t in trades if t > 0]
+    open_value = sum(qty * last for qty in sim.bought_at.values())
+    equity = sim.equity(last)
+    wins = [t for t in sim.trades if t > 0]
     return {
-        "trades": len(trades),
+        "trades": len(sim.trades),
         "wins": len(wins),
-        "win_rate": len(wins) / len(trades) if trades else None,
+        "win_rate": len(wins) / len(sim.trades) if sim.trades else None,
         "grid_pnl": equity - amount,
-        "fees": round(fees, 4),
-        "open_levels": len(bought_at),
+        "fees": round(sim.fees, 4),
+        "open_levels": len(sim.bought_at),
         "open_inventory_value": open_value,
         "buy_hold_pnl": amount * (last / float(candles[0]["close"]) - 1),
         "final_equity": equity,
