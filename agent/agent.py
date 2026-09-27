@@ -30,12 +30,48 @@ from mcp.client.stdio import stdio_client
 
 from agent.memory.store import MemoryStore
 from agent.safety import SafetyGuard, SafetyViolation
+from analytics.store import AnalyticsStore, new_decision_id
+from analytics.versioning import current_versions
 from integrations.llm import create_llm_client
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "trading_manager.md"
 MAX_TOOL_ROUNDS = 25
 
 _ANALYSIS_BLOCK = re.compile(r"```analysis\s*(\{.*?\})\s*```", re.DOTALL)
+_EXECUTOR_ID = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,48}")
+
+_STANDARD_REGIMES = {
+    "TRENDING_BULL", "TRENDING_BEAR", "RANGING", "HIGH_VOLATILITY",
+    "LOW_VOLATILITY", "BREAKOUT", "UNCERTAIN",
+}
+_REGIME_ALIASES = {
+    "TRENDING_UP": "TRENDING_BULL",
+    "TRENDING_DOWN": "TRENDING_BEAR",
+    "BULL": "TRENDING_BULL",
+    "BEAR": "TRENDING_BEAR",
+    "VOLATILE": "HIGH_VOLATILITY",
+}
+
+
+def normalize_regime(value: Any) -> str | None:
+    """Map free-form LLM regime labels onto the standard vocabulary."""
+    if not value:
+        return None
+    v = str(value).strip().upper().replace(" ", "_").replace("-", "_")
+    v = _REGIME_ALIASES.get(v, v)
+    return v if v in _STANDARD_REGIMES else "UNCERTAIN"
+
+
+def extract_executor_id(result_text: str) -> str | None:
+    """Pull the executor id out of a manage_executors/create MCP result."""
+    try:
+        data = json.loads(result_text)
+        if isinstance(data, dict) and data.get("executor_id"):
+            return str(data["executor_id"])
+    except (json.JSONDecodeError, TypeError):
+        pass
+    match = _EXECUTOR_ID.search(result_text or "")
+    return match.group(0) if match else None
 
 
 def extract_analysis_blocks(text: str) -> list[dict[str, Any]]:
@@ -65,6 +101,19 @@ class TradingAgent:
         self._session: ClientSession | None = None
         self._tools: list[dict[str, Any]] | None = None
         self._lock = asyncio.Lock()
+        self.versions = current_versions()
+        # Analytics path (AI Quant Lab). Best-effort: if the analytics DB
+        # cannot be opened the agent keeps trading without it.
+        try:
+            self.analytics: AnalyticsStore | None = AnalyticsStore(
+                os.getenv("ANALYTICS_DB", "data/analytics.db")
+            )
+        except Exception:
+            self.analytics = None
+        # Per-run capture state, reset at the start of each run().
+        self._created_executors: list[str] = []
+        self._blocked = False
+        self._market_snapshot: dict[str, Any] = {}
 
     async def _ensure_session(self) -> tuple[ClientSession, list[dict[str, Any]]]:
         async with self._lock:
@@ -97,9 +146,16 @@ class TradingAgent:
             self._exit_stack = None
             self._session = None
             self._tools = None
+        if self.analytics is not None:
+            self.analytics.close()
 
     async def run(self, user_message: str, history: list[dict[str, Any]] | None = None) -> str:
         session, tools = await self._ensure_session()
+        decision_id = new_decision_id()
+        self._created_executors = []
+        self._blocked = False
+        self._market_snapshot = {}
+        portfolio_ctx = await self._snapshot_portfolio()
         messages = list(history or [])
         messages.append({"role": "user", "content": user_message})
         answer = await self._tool_loop(session, tools, messages)
@@ -116,7 +172,105 @@ class TradingAgent:
                 evidence=block.get("evidence"),
                 raw=json.dumps(block, ensure_ascii=False),
             )
+        self._record_decision_events(decision_id, answer, portfolio_ctx)
         return answer
+
+    async def _snapshot_portfolio(self) -> dict[str, Any]:
+        """Best-effort portfolio snapshot for decision replay.
+
+        Read-only GET/POST against the Hummingbot API; any failure returns
+        {} so a monitoring outage never blocks the trading loop.
+        """
+        try:
+            import httpx
+
+            base = os.getenv("HUMMINGBOT_API_URL", "http://127.0.0.1:8100").rstrip("/")
+            auth = (
+                os.getenv("HUMMINGBOT_USERNAME", "admin"),
+                os.getenv("HUMMINGBOT_PASSWORD", "admin"),
+            )
+            async with httpx.AsyncClient(base_url=base, auth=auth, timeout=10.0) as client:
+                portfolio = (await client.post("/portfolio/state", json={})).json()
+                positions = (await client.post("/trading/positions", json={})).json()
+            balances = []
+            equity = 0.0
+            for account, connectors in (portfolio or {}).items():
+                for connector, tokens in (connectors or {}).items():
+                    for token in tokens or []:
+                        value = float(token.get("value") or 0)
+                        equity += value
+                        balances.append({
+                            "account": account, "connector": connector,
+                            "token": token.get("token"), "value": value,
+                        })
+            pos_rows = positions.get("data", []) if isinstance(positions, dict) else []
+            return {
+                "equity": equity,
+                "balances": balances,
+                "open_positions": [
+                    {
+                        "trading_pair": p.get("trading_pair"),
+                        "side": p.get("side"),
+                        "amount": p.get("amount"),
+                        "entry_price": p.get("entry_price"),
+                        "unrealized_pnl": p.get("unrealized_pnl"),
+                    }
+                    for p in pos_rows
+                ],
+                "open_position_count": len(pos_rows),
+            }
+        except Exception:
+            return {}
+
+    def _record_decision_events(
+        self, decision_id: str, answer: str, portfolio_ctx: dict[str, Any]
+    ) -> None:
+        """Persist structured decision events (analytics path, best-effort)."""
+        if self.analytics is None:
+            return
+        try:
+            experiment = self.analytics.get_active_experiment()
+            experiment_id = experiment["experiment_id"] if experiment else None
+            execution_id = self._created_executors[0] if self._created_executors else None
+            risk_status = "BLOCKED" if self._blocked else "PASSED"
+            blocks = extract_analysis_blocks(answer)
+            common = {
+                "mode": self.guard.mode,
+                "risk_status": risk_status,
+                "market_context": self._market_snapshot,
+                "portfolio_context": portfolio_ctx,
+                "experiment_id": experiment_id,
+                **self.versions,
+            }
+            if blocks:
+                for i, block in enumerate(blocks):
+                    self.analytics.record_decision_event(
+                        decision_id=decision_id if i == 0 else new_decision_id(),
+                        symbol=block.get("symbol"),
+                        market_regime=normalize_regime(block.get("regime")),
+                        action=block.get("action"),
+                        strategy=block.get("strategy"),
+                        confidence=block.get("confidence"),
+                        evidence=block.get("evidence"),
+                        outcome_status="EXECUTED" if execution_id else "RECORDED",
+                        execution_id=execution_id if i == 0 else None,
+                        **common,
+                    )
+            else:
+                action = (
+                    "TRADE" if self._created_executors
+                    else "REJECT" if self._blocked
+                    else "SCAN"
+                )
+                self.analytics.record_decision_event(
+                    decision_id=decision_id,
+                    action=action,
+                    outcome_status="EXECUTED" if self._created_executors else "RECORDED",
+                    execution_id=execution_id,
+                    **common,
+                )
+        except Exception:
+            pass  # analytics must never break the trading path
 
     async def _tool_loop(
         self,
@@ -155,6 +309,7 @@ class TradingAgent:
             self.guard.check_tool_call(name, arguments)
             await self._check_position_capacity(name, arguments)
         except SafetyViolation as exc:
+            self._blocked = True
             self.memory.record_decision(
                 mode=self.guard.mode,
                 market_context="",
@@ -169,6 +324,15 @@ class TradingAgent:
         text = "\n".join(
             getattr(part, "text", str(part)) for part in result.content
         )
+        if not result.is_error:
+            if name == "manage_executors" and arguments.get("action") == "create":
+                executor_id = extract_executor_id(text)
+                if executor_id:
+                    self._created_executors.append(executor_id)
+            elif name == "get_market_data":
+                # Keep the freshest market data reply as this run's market
+                # snapshot for decision replay (truncated; no reasoning).
+                self._market_snapshot = {"tool_result": text[:4000]}
         self.memory.record_decision(
             mode=self.guard.mode,
             market_context="",

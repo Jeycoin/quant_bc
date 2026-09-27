@@ -27,6 +27,8 @@ from fastapi.responses import StreamingResponse
 
 from dashboard_api.events import analysis_to_event, decision_to_event, review_to_event
 from dashboard_api.hummingbot import EndpointNotAllowed, ReadOnlyHummingbot
+from dashboard_api.lab import analytics_db_ok
+from dashboard_api.lab import router as lab_router
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -85,13 +87,14 @@ def _memory_rows(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
     conn.close()
     return [dict(r) for r in rows]
 
-app = FastAPI(title="AI Quant Dashboard API", version="0.1.0")
+app = FastAPI(title="AI Quant Dashboard API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+app.include_router(lab_router)
 
 hb = ReadOnlyHummingbot()
 
@@ -153,6 +156,23 @@ async def get_health() -> dict[str, Any]:
         checks["agent"] = {"ok": True, "detail": f"LLM configured ({provider}/{model}); agent runs on demand"}
     else:
         checks["agent"] = {"ok": False, "detail": f"no API key for provider {provider}"}
+
+    checks["data"] = analytics_db_ok()
+
+    try:
+        from analytics.store import AnalyticsStore
+
+        store = AnalyticsStore(str(REPO_ROOT / "data" / "analytics.db"))
+        try:
+            active = store.get_active_experiment()
+        finally:
+            store.close()
+        if active:
+            checks["experiment"] = {"ok": True, "detail": f"running: {active['name']}"}
+        else:
+            checks["experiment"] = {"ok": True, "detail": "no active experiment"}
+    except Exception as exc:
+        checks["experiment"] = {"ok": False, "detail": str(exc)}
 
     return {"mode": trading_mode(), "checks": checks,
             "ok": all(c["ok"] for c in checks.values())}

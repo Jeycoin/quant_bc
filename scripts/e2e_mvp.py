@@ -25,6 +25,12 @@ REQUEST = (
 
 
 async def main() -> None:
+    if sys.platform == "win32":
+        # Force UTF-8 so LLM replies (and any memory records derived from
+        # them) are not mangled by the Windows console code page.
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdin.reconfigure(encoding="utf-8")
+
     load_dotenv(".env")
     request = sys.argv[1] if len(sys.argv) > 1 else REQUEST
     guard = SafetyGuard.from_env()

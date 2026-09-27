@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type JournalEntry } from "@/lib/api";
+import { DecisionReplay } from "@/components/decision-replay";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -33,6 +34,27 @@ const fmtDuration = (s?: number | null) => {
   const m = Math.floor((s % 3600) / 60);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 };
+
+/** Decision Replay section: finds the agent decision that created this
+ *  executor (via execution_id link) and renders the full replay bundle. */
+function LinkedReplay({ executorId }: { executorId: string }) {
+  const linked = useQuery({
+    queryKey: ["lab-decision-by-exec", executorId],
+    queryFn: () => api.labDecisions({ execution_id: executorId }),
+    retry: false,
+  });
+  if (linked.isPending) return <Skeleton className="h-24" />;
+  const decision = linked.data?.data?.[0];
+  if (!decision) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        无关联的 AI 决策记录（该执行器可能是手动创建的 baseline，或创建于
+        decision events 上线之前）。
+      </p>
+    );
+  }
+  return <DecisionReplay decisionId={decision.decision_id} />;
+}
 
 export default function JournalPage() {
   const [symbol, setSymbol] = useState<string>("");
@@ -167,6 +189,12 @@ export default function JournalPage() {
                     </span>
                   </div>
                   <div>Close type: {selected.close_type ?? "—"}</div>
+                </div>
+                <div>
+                  <p className="mb-1 text-xs font-medium uppercase text-muted-foreground">
+                    Decision Replay
+                  </p>
+                  <LinkedReplay executorId={selected.executor_id} />
                 </div>
                 <div>
                   <p className="mb-1 text-xs font-medium uppercase text-muted-foreground">

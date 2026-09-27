@@ -243,6 +243,36 @@ AI Market View 的数据来源：Agent 每次分析后在回复末尾输出 ```a
 Hummingbot API——下单、撤单、创建执行器等写接口在代码层面不可达。
 Dashboard 不能切换交易模式（模式由 `.env` 的 `LIVE_TRADING` + 重启决定）。
 
+### AI Quant Lab（/lab）
+
+实验分析平台：KPI（PnL/回撤/胜率/Profit Factor）、AI 决策分布、
+AI vs Baseline 对比、策略归因、Market Regime 归因、Decisions 列表
+（点击查看 Decision Replay：市场快照 → 决策 → 风险 → 执行 → 复盘）、
+实验列表与报告下载。
+
+数据来自 `data/analytics.db`（decision_events / trade_events /
+review_events / experiments 四张表），与交易路径隔离——分析库故障不会
+影响交易，Agent 端写入是 best-effort。
+
+实验管理：
+
+```bash
+python scripts/experiment.py start "7d-testnet-v1" --symbols BTC,ETH --strategies grid
+python scripts/experiment.py list
+python scripts/experiment.py report <experiment_id> -o report.md
+python scripts/experiment.py stop <experiment_id>
+
+# Baseline（不经过 Agent 的固定网格策略，用于 AI vs Baseline 对比）
+python scripts/baseline_grid.py --pair BTC-USDT --amount 200 \
+    --start 83000 --end 85000 --experiment <experiment_id>
+
+# 长期实验的自动扫描循环（每 30 分钟扫描一次，每 6 个周期复盘一次）
+python scripts/agent_loop.py --interval-min 30 --review-every 6
+```
+
+实验运行期间不要修改 prompt / settings.yaml——版本哈希会变化，不同版本
+的交易不能混在一起分析。
+
 ## 8. 安全须知
 
 - 默认且始终建议 **PAPER 模式**。`LIVE_TRADING=true` 只会由你本人设置，

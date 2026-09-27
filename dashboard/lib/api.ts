@@ -136,6 +136,144 @@ export type JournalEntry = {
 export type Review = { id: number; ts: number; subject: string; review: string };
 export type Note = { id: number; ts: number; topic: string; note: string };
 
+export type DecisionEvent = {
+  decision_id: string;
+  ts: number;
+  mode: string;
+  symbol: string | null;
+  market_regime: string | null;
+  action: string | null;
+  strategy: string | null;
+  confidence: number | null;
+  evidence: string | null;
+  risk_status: string | null;
+  outcome_status: string | null;
+  execution_id: string | null;
+  agent_version: string | null;
+  prompt_version: string | null;
+  config_version: string | null;
+  experiment_id: string | null;
+};
+
+export type DecisionEventFull = DecisionEvent & {
+  tool_name: string | null;
+  tool_arguments: Record<string, unknown>;
+  market_context: Record<string, unknown>;
+  portfolio_context: {
+    equity?: number;
+    balances?: { account: string; connector: string; token: string; value: number }[];
+    open_positions?: {
+      trading_pair: string; side: string; amount: number;
+      entry_price: number; unrealized_pnl: number;
+    }[];
+    open_position_count?: number;
+  };
+};
+
+export type TradeEvent = {
+  executor_id: string;
+  decision_id: string | null;
+  ts_open: number | null;
+  ts_close: number | null;
+  symbol: string | null;
+  strategy: string | null;
+  connector: string | null;
+  side: string | null;
+  status: string | null;
+  close_type: string | null;
+  pnl_quote: number | null;
+  pnl_pct: number | null;
+  filled_amount_quote: number | null;
+  fees_quote: number | null;
+  regime_at_entry: string | null;
+  source: string | null;
+  experiment_id: string | null;
+};
+
+export type ReviewEvent = {
+  review_id: number;
+  ts: number;
+  decision_id: string | null;
+  execution_id: string | null;
+  outcome: string | null;
+  decision_quality: string | null;
+  execution_quality: string | null;
+  regime_accuracy: string | null;
+  main_error: string | null;
+  main_success: string | null;
+  lesson: string | null;
+};
+
+export type ReplayBundle = {
+  decision: DecisionEventFull;
+  trade: TradeEvent | null;
+  reviews: ReviewEvent[];
+};
+
+export type Experiment = {
+  experiment_id: string;
+  name: string;
+  status: string;
+  started_at: number;
+  ended_at: number | null;
+  symbols: string;
+  strategies: string;
+  agent_version: string | null;
+  prompt_version: string | null;
+  config_version: string | null;
+  notes: string | null;
+};
+
+export type TradingMetrics = {
+  trade_count: number;
+  closed_count: number;
+  total_pnl_quote: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  profit_factor: number | null;
+  expectancy: number | null;
+  avg_holding_s: number | null;
+  total_fees_quote: number;
+};
+
+export type AttributionRow = {
+  bucket: string;
+  trade_count: number;
+  closed_count: number;
+  total_pnl_quote: number;
+  total_fees_quote: number;
+  win_rate: number | null;
+};
+
+export type LabMetrics = {
+  trading: TradingMetrics;
+  equity: {
+    total_return: number | null;
+    daily_return: number | null;
+    weekly_return: number | null;
+    max_drawdown_pct: number | null;
+    volatility_daily: number | null;
+    sharpe_like: number | null;
+    snapshot_count: number;
+  };
+  execution: {
+    order_count: number;
+    fill_rate: number | null;
+    cancel_rate: number | null;
+    failure_rate: number | null;
+    avg_slippage_pct: number | null;
+  };
+  exposure: {
+    gross_exposure: number;
+    exposure_pct: number | null;
+    position_concentration: number | null;
+    by_symbol: Record<string, number>;
+  };
+  decisions: Record<string, number>;
+  attribution: { strategy: AttributionRow[]; regime: AttributionRow[] };
+};
+
 export type Executor = {
   executor_id: string;
   executor_type: string;
@@ -228,6 +366,29 @@ export const api = {
   journal: () => get<{ data: JournalEntry[] }>("/api/journal"),
   reviews: () => get<{ data: Review[] }>("/api/memory/reviews"),
   notes: () => get<{ data: Note[] }>("/api/memory/notes"),
+  labDecisions: (params: Record<string, string> = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return get<{ data: DecisionEvent[] }>(`/api/lab/decisions${qs ? `?${qs}` : ""}`);
+  },
+  labDecisionReplay: (id: string) =>
+    get<{ data: ReplayBundle }>(`/api/lab/decisions/${id}`),
+  labTrades: (params: Record<string, string> = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return get<{ synced: number; data: TradeEvent[] }>(`/api/lab/trades${qs ? `?${qs}` : ""}`);
+  },
+  labDecisionDistribution: () =>
+    get<{ data: Record<string, number> }>("/api/lab/decision-distribution"),
+  labExperiments: () => get<{ data: Experiment[] }>("/api/lab/experiments"),
+  labMetrics: (experimentId?: string) =>
+    get<{ data: LabMetrics }>(
+      `/api/lab/metrics${experimentId ? `?experiment_id=${experimentId}` : ""}`
+    ),
+  labCompare: (experimentId?: string) =>
+    get<{ data: Record<string, TradingMetrics> }>(
+      `/api/lab/compare${experimentId ? `?experiment_id=${experimentId}` : ""}`
+    ),
+  labReport: (experimentId: string) =>
+    get<{ data: string }>(`/api/lab/report/${experimentId}`),
 };
 
 export const API_BASE_URL = API_BASE;

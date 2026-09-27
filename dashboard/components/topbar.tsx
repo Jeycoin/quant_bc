@@ -12,6 +12,8 @@ const CHECK_LABELS: Record<string, string> = {
   mcp: "MCP",
   exchange: "EXCHANGE",
   database: "DATABASE",
+  data: "DATA",
+  experiment: "EXPERIMENT",
 };
 
 function StatusDot({ ok }: { ok: boolean }) {

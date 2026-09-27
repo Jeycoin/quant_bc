@@ -53,11 +53,16 @@ end of your final reply. This block is parsed by software and shown on a
 dashboard — put only conclusions in it, never reasoning or chain-of-thought.
 
 ```analysis
-{"symbol": "BTC", "regime": "ranging|trending_up|trending_down|volatile",
+{"symbol": "BTC", "regime": "TRENDING_BULL|TRENDING_BEAR|RANGING|HIGH_VOLATILITY|LOW_VOLATILITY|BREAKOUT|UNCERTAIN",
  "trend": "one short phrase", "volatility": "low|normal|high",
  "action": "WAIT|WATCH|LONG|SHORT", "strategy": "grid|momentum|mean_reversion|breakout|none",
  "confidence": 0.0, "evidence": "one-sentence evidence summary"}
 ```
+
+Use the standard regime vocabulary exactly as listed — it feeds
+regime-attribution analytics. Use UNCERTAIN when evidence is mixed;
+regime is a classification of the current market state, not a price
+prediction.
 
 # Review
 
