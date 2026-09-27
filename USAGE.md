@@ -273,6 +273,26 @@ python scripts/agent_loop.py --interval-min 30 --review-every 6
 实验运行期间不要修改 prompt / settings.yaml——版本哈希会变化，不同版本
 的交易不能混在一起分析。
 
+### 7 天 → 30 天晋级（Phase 9 → Phase 10）
+
+7 天实验无严重问题后晋级：
+
+```bash
+# 1. 生成并检查 7 天报告（重点：风险事件、执行失败率、决策质量分布）
+python scripts/experiment.py report exp-<id> -o report-7d.md
+
+# 2. 结束 7 天实验，开启 30 天实验（同一套基础设施，同一版本冻结纪律）
+python scripts/experiment.py stop exp-<7d-id>
+python scripts/experiment.py start "30d-testnet-v1" --symbols BTC,ETH \
+    --strategies grid,momentum,mean_reversion,breakout
+
+# 3. agent loop 无需重启——它自动打标当前 running 状态的实验
+```
+
+晋级门槛（全部满足才晋级）：无安全违规绕过、无执行器异常失控、
+Memory/Analytics 无持续写入失败、复盘质量分布中 execution_failure 占多数
+时先修执行链路再晋级。
+
 ## 8. 安全须知
 
 - 默认且始终建议 **PAPER 模式**。`LIVE_TRADING=true` 只会由你本人设置，
