@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -250,6 +251,57 @@ async def get_executor_detail(executor_id: str) -> dict[str, Any]:
     if isinstance(detail, dict) and detail.get("executor_type") == "grid_executor":
         detail["grid_info"] = _grid_info(detail.get("config") or {})
     return detail
+
+
+MARKET_SYMBOLS = {"BTC": "BTC-USD", "ETH": "ETH-USD"}
+MARKET_INTERVALS = {"1m", "5m", "15m", "1h"}
+
+
+@app.get("/api/market")
+async def get_market(symbol: str = "BTC", interval: str = "1m", limit: int = 200) -> dict[str, Any]:
+    symbol = symbol.upper()
+    if symbol not in MARKET_SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"unsupported symbol {symbol!r}")
+    if interval not in MARKET_INTERVALS:
+        raise HTTPException(status_code=400, detail=f"unsupported interval {interval!r}")
+    pair = MARKET_SYMBOLS[symbol]
+    limit = max(10, min(limit, 500))
+
+    candles, funding, book = await asyncio.gather(
+        _hb_call("POST", "/market-data/candles", json={
+            "connector_name": MARKET_PROBE_CONNECTOR, "trading_pair": pair,
+            "interval": interval, "max_records": limit}),
+        _hb_call("POST", "/market-data/funding-info", json={
+            "connector_name": MARKET_PROBE_CONNECTOR, "trading_pair": pair}),
+        _hb_call("POST", "/market-data/order-book", json={
+            "connector_name": MARKET_PROBE_CONNECTOR, "trading_pair": pair, "depth": 10}),
+    )
+
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    best_bid = bids[0]["price"] if bids else None
+    best_ask = asks[0]["price"] if asks else None
+    spread = (best_ask - best_bid) if best_bid and best_ask else None
+    last_price = candles[-1]["close"] if candles else None
+
+    return {
+        "symbol": symbol,
+        "pair": pair,
+        "connector": MARKET_PROBE_CONNECTOR,
+        "interval": interval,
+        "last_price": last_price,
+        "candles": candles,
+        "funding": funding,
+        "order_book": {
+            "bids": bids,
+            "asks": asks,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "spread_pct": (spread / best_bid * 100) if spread and best_bid else None,
+        },
+        "open_interest": None,  # Hummingbot does not expose OI; phase 2+ external data
+    }
 
 
 @app.get("/api/memory/decisions")

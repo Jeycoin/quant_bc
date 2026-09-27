@@ -124,6 +124,40 @@ export type GridInfo = {
   indicative: boolean;
 };
 
+export type Candle = {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  n_trades: number;
+};
+
+export type MarketData = {
+  symbol: string;
+  pair: string;
+  connector: string;
+  interval: string;
+  last_price: number | null;
+  candles: Candle[];
+  funding: {
+    funding_rate: number;
+    next_funding_time: number;
+    mark_price: number;
+    index_price: number;
+  };
+  order_book: {
+    bids: { price: number; amount: number }[];
+    asks: { price: number; amount: number }[];
+    best_bid: number | null;
+    best_ask: number | null;
+    spread: number | null;
+    spread_pct: number | null;
+  };
+  open_interest: number | null;
+};
+
 export const api = {
   mode: () => get<{ mode: string; live_trading_env: boolean; note: string }>("/api/mode"),
   health: () => get<Health>("/api/health"),
@@ -138,4 +172,6 @@ export const api = {
   executors: (status?: string) =>
     get<{ data: Executor[] }>(`/api/executors${status ? `?status=${status}` : ""}`),
   executor: (id: string) => get<Executor>(`/api/executors/${id}`),
+  market: (symbol: string, interval = "1m", limit = 200) =>
+    get<MarketData>(`/api/market?symbol=${symbol}&interval=${interval}&limit=${limit}`),
 };
