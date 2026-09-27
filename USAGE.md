@@ -196,9 +196,34 @@ scripts/
 ├── test_mcp.py           # MCP 工具冒烟测试
 └── e2e_mvp.py            # 单次任务运行
 docs/research-notes.md    # Hummingbot 能力调研与实测记录
+dashboard_api/            # Dashboard 只读后端（FastAPI，端点白名单）
+dashboard/                # Dashboard 前端（Next.js + Tailwind + shadcn/ui）
 ```
 
-## 7. 安全须知
+## 7. Dashboard（可视化层）
+
+Dashboard 是现有系统的只读可视化层，不包含任何交易逻辑。
+
+```bash
+# 后端（FastAPI，端口 8200，只读白名单）
+pip install -e ".[dashboard]"
+python -m uvicorn dashboard_api.main:app --port 8200
+
+# 前端（Next.js，端口 3000）
+cd dashboard
+pnpm install
+pnpm dev          # 开发模式；或 pnpm build && pnpm start
+```
+
+打开 http://localhost:3000 ：顶栏显示五项系统健康状态（AGENT / HUMMINGBOT /
+MCP / EXCHANGE / DATABASE）和当前交易模式（TESTNET / LIVE），Overview 页显示
+净值、执行器盈亏、余额和持仓，每 10 秒自动刷新。
+
+安全设计：`dashboard_api/hummingbot.py` 用端点白名单约束后端能调用的
+Hummingbot API——下单、撤单、创建执行器等写接口在代码层面不可达。
+Dashboard 不能切换交易模式（模式由 `.env` 的 `LIVE_TRADING` + 重启决定）。
+
+## 8. 安全须知
 
 - 默认且始终建议 **PAPER 模式**。`LIVE_TRADING=true` 只会由你本人设置，
   Agent 无法自行开启。
