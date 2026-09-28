@@ -104,7 +104,17 @@ class IntelSnapshot:
     meta: dict[str, Any] = field(default_factory=dict)  # provider health etc.
 
     def for_llm(self, max_news: int = 5, max_narratives: int = 3) -> dict[str, Any]:
-        """Compact JSON-ready view with explicit data ages."""
+        """Compact JSON-ready view with explicit data ages.
+
+        INTEL_SECTIONS env (comma-separated subset of
+        social,onchain,news,narratives) enables information-ablation
+        experiments; unset = full intelligence.
+        """
+        import os
+
+        sections = os.getenv("INTEL_SECTIONS", "").strip()
+        enabled = (set(s.strip() for s in sections.split(",") if s.strip())
+                   if sections else {"social", "onchain", "news", "narratives"})
         now = time.time()
 
         def with_age(item: dict[str, Any]) -> dict[str, Any]:
@@ -116,9 +126,11 @@ class IntelSnapshot:
 
         return {
             "generated_at": self.generated_at,
-            "social": self.social,
-            "onchain": self.onchain,
-            "news": [with_age(n) for n in self.news[:max_news]],
-            "narratives": [with_age(n) for n in self.narratives[:max_narratives]],
-            "meta": self.meta,
+            "social": self.social if "social" in enabled else {},
+            "onchain": self.onchain if "onchain" in enabled else {},
+            "news": ([with_age(n) for n in self.news[:max_news]]
+                     if "news" in enabled else []),
+            "narratives": ([with_age(n) for n in self.narratives[:max_narratives]]
+                           if "narratives" in enabled else []),
+            "meta": {**self.meta, "sections": sorted(enabled)},
         }
