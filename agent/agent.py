@@ -309,6 +309,7 @@ class TradingAgent:
                 "market_context": market_ctx,
                 "portfolio_context": portfolio_ctx,
                 "experiment_id": experiment_id,
+                "llm_model": self.llm.model,
                 **self.versions,
             }
             if blocks:
@@ -629,6 +630,7 @@ class TradingAgent:
                 tool_arguments=arguments,
                 outcome_status="REJECTED",
                 rejection_reason=message[:500],
+                llm_model=self.llm.model,
                 experiment_id=experiment["experiment_id"] if experiment else None,
                 **self.versions,
             )
@@ -640,7 +642,10 @@ class TradingAgent:
 
         Best-effort on the analytics path: any failure returns None and the
         agent runs with market data only (never blocked by intel outages).
+        INTEL_DISABLED=1 turns this off for information-ablation experiments.
         """
+        if os.getenv("INTEL_DISABLED", "").strip().lower() in ("1", "true"):
+            return None
         try:
             from intelligence.snapshot import build_snapshot
             from intelligence.store import IntelligenceStore

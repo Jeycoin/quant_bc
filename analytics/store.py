@@ -123,6 +123,8 @@ class AnalyticsStore:
         decision_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(decision_events)")}
         if "rejection_reason" not in decision_cols:
             self._conn.execute("ALTER TABLE decision_events ADD COLUMN rejection_reason TEXT")
+        if "llm_model" not in decision_cols:
+            self._conn.execute("ALTER TABLE decision_events ADD COLUMN llm_model TEXT")
         self._conn.commit()
 
     # ------------------------------------------------------------- decisions
@@ -149,6 +151,7 @@ class AnalyticsStore:
         config_version: str | None = None,
         experiment_id: str | None = None,
         rejection_reason: str | None = None,
+        llm_model: str | None = None,
         ts: float | None = None,
     ) -> str:
         did = decision_id or new_decision_id()
@@ -158,8 +161,8 @@ class AnalyticsStore:
             " confidence, evidence, risk_status, tool_name, tool_arguments,"
             " outcome_status, execution_id, market_context, portfolio_context,"
             " agent_version, prompt_version, config_version, experiment_id,"
-            " rejection_reason)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " rejection_reason, llm_model)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 did, ts if ts is not None else time.time(), mode, symbol,
                 market_regime, action, strategy, confidence, evidence,
@@ -168,7 +171,7 @@ class AnalyticsStore:
                 json.dumps(market_context or {}, ensure_ascii=False),
                 json.dumps(portfolio_context or {}, ensure_ascii=False),
                 agent_version, prompt_version, config_version, experiment_id,
-                rejection_reason,
+                rejection_reason, llm_model,
             ),
         )
         self._conn.commit()

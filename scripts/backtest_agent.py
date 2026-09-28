@@ -190,7 +190,7 @@ async def main() -> None:
         name=f"bt-replay-{args.days}d",
         symbols=SYMBOLS,
         strategies=["grid", "position"],
-        notes="historical forward-replay backtest; indicative only",
+        notes=f"historical forward-replay backtest; indicative only; model={llm.model}",
         status="backtest",  # never 'running' — the live agent loop tags
                             # decisions with the active 'running' experiment
         **versions,
@@ -284,6 +284,7 @@ async def main() -> None:
                 decision_id=decision_id, mode="BACKTEST", action="SCAN",
                 outcome_status="NO_BLOCK", market_context=context,
                 portfolio_context=context["portfolio"], experiment_id=exp_id,
+                llm_model=llm.model,
                 **versions)
             continue
         for block in blocks:
@@ -380,6 +381,7 @@ async def main() -> None:
                 execution_id=execution_id, market_context=context["markets"].get(sym),
                 portfolio_context=context["portfolio"], experiment_id=exp_id,
                 rejection_reason=rejection_reason,
+                llm_model=llm.model,
                 **versions)
         print(f"  [{time.strftime('%m-%d %H:%M', time.gmtime(ts))}] "
               + " ".join(f"{b.get('symbol')}:{b.get('action')}/{b.get('regime')}"
