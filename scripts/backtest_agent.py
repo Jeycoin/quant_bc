@@ -412,7 +412,7 @@ async def main() -> None:
             regime_at_entry=g.regime_at_entry,
             source="agent", experiment_id=exp_id)
 
-    # baselines over the same window: fixed grid per symbol + buy&hold
+    # baselines over the same window: fixed grid + fixed trend + buy&hold
     from analytics import metrics as m
     agent_eq = m.equity_metrics(equity_curve)
     baselines = {}
@@ -427,8 +427,42 @@ async def main() -> None:
             symbol=sym, strategy="grid_executor", status="CLOSED",
             close_type="REPLAY_END", pnl_quote=base.equity(last) - GRID_SIZE,
             fees_quote=base.fees, source="baseline", experiment_id=exp_id)
+
+        # fixed trend baseline: EMA20/EMA50 cross, same barriers as agent positions
+        def _ema(vals, n):
+            k = 2 / (n + 1)
+            e = vals[0]
+            for v in vals[1:]:
+                e = v * k + e * (1 - k)
+            return e
+        trend_pnl, trend_trades, trend_pos = 0.0, 0, None
+        closes_so_far: list[float] = []
+        for c in window:
+            closes_so_far.append(float(c["close"]))
+            if trend_pos is not None:
+                result = trend_pos.check_exit(c, c["timestamp"])
+                if result:
+                    pnl, reason, fees = result
+                    trend_pnl += pnl
+                    trend_trades += 1
+                    trend_pos = None
+            elif len(closes_so_far) >= 80 and \
+                    _ema(closes_so_far[-40:], 20) > _ema(closes_so_far[-80:], 50):
+                px_now = float(c["close"])
+                trend_pos = SimPosition(
+                    sym, "LONG", px_now, POSITION_SIZE / px_now,
+                    c["timestamp"] + POS_TIME_LIMIT_S, c["timestamp"],
+                    f"bt-baseline-trend-{sym}-{int(c['timestamp'])}", None)
+        if trend_pos is not None:
+            sign = 1
+            fees = (trend_pos.entry + last) * trend_pos.qty * FEE_RATE
+            trend_pnl += (last - trend_pos.entry) * trend_pos.qty * sign - fees
+            trend_trades += 1
+
         baselines[sym] = {
             "fixed_grid_pnl": round(base.equity(last) - GRID_SIZE, 4),
+            "fixed_trend_pnl": round(trend_pnl, 4),
+            "fixed_trend_trades": trend_trades,
             "buy_hold_pnl": round(GRID_SIZE * (last / first - 1), 4),
         }
 
@@ -443,6 +477,7 @@ async def main() -> None:
           f" · trades {trade_count}")
     for sym, b in baselines.items():
         print(f"baseline {sym}: fixed grid {b['fixed_grid_pnl']:+.2f}"
+              f" · fixed trend {b['fixed_trend_pnl']:+.2f} ({b['fixed_trend_trades']} trades)"
               f" · buy&hold {b['buy_hold_pnl']:+.2f} (on ${GRID_SIZE:.0f})")
     print("note: unknown model training cutoff — contamination cannot be ruled out;")
 

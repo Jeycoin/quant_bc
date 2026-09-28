@@ -132,6 +132,7 @@ class TradingAgent:
         self._created_executors: list[str] = []
         self._blocked = False
         self._market_snapshot: dict[str, Any] = {}
+        self._intel_snapshot: dict[str, Any] | None = None
         # Set when a memory write fails — degraded mode: no new trades
         # (master prompt §28: never trade freely when memory is down).
         self._memory_broken = False
@@ -190,6 +191,11 @@ class TradingAgent:
         self._created_executors = []
         self._blocked = False
         self._market_snapshot = {}
+        self._intel_snapshot = await self._intel_context()
+        if self._intel_snapshot:
+            user_message = (
+                user_message + "\n\n[intelligence]\n"
+                + json.dumps(self._intel_snapshot, ensure_ascii=False))
         portfolio_ctx = await self._snapshot_portfolio()
         messages = list(history or [])
         messages.append({"role": "user", "content": user_message})
@@ -294,10 +300,13 @@ class TradingAgent:
             execution_id = self._created_executors[0] if self._created_executors else None
             risk_status = "BLOCKED" if self._blocked else "PASSED"
             blocks = extract_analysis_blocks(answer)
+            market_ctx = dict(self._market_snapshot)
+            if self._intel_snapshot:
+                market_ctx["intelligence"] = self._intel_snapshot
             common = {
                 "mode": self.guard.mode,
                 "risk_status": risk_status,
-                "market_context": self._market_snapshot,
+                "market_context": market_ctx,
                 "portfolio_context": portfolio_ctx,
                 "experiment_id": experiment_id,
                 **self.versions,
@@ -430,7 +439,7 @@ class TradingAgent:
         (rejection_message, stage) or (None, None) when all gates pass.
         """
         cfg = arguments.get("executor_config", {}) or {}
-        etype = str(cfg.get("type", ""))
+        etype = str(arguments.get("executor_type") or cfg.get("type") or "")
         pair = str(cfg.get("trading_pair", ""))
         symbol = pair.partition("-")[0] or None
 
@@ -509,13 +518,16 @@ class TradingAgent:
 
     async def _cost_check(self, etype: str, cfg: dict[str, Any]):
         """Run the cost validator for a grid/position executor config."""
+        barrier = cfg.get("triple_barrier_config", {}) or {}
         if "grid" in etype:
             amount = cfg.get("total_amount_quote")
-            tp = cfg.get("take_profit")
+            # grid TP may live in triple_barrier_config
+            tp = cfg.get("take_profit", barrier.get("take_profit"))
             if amount is None or tp is None:
                 return None
-            maker_entry = int(cfg.get("order_type", 3)) == 3  # 3 = LIMIT
-            maker_exit = int(cfg.get("take_profit_order_type", 3)) == 3
+            maker_entry = int(cfg.get("order_type", barrier.get("open_order_type", 3))) == 3
+            maker_exit = int(cfg.get("take_profit_order_type",
+                                     barrier.get("take_profit_order_type", 3))) == 3
             return self.cost_validator.validate_grid(
                 float(amount), float(tp),
                 max_open_orders=cfg.get("max_open_orders"),
@@ -523,7 +535,6 @@ class TradingAgent:
             )
         # position executor: notional = base amount * current price
         amount = cfg.get("amount")
-        barrier = cfg.get("triple_barrier_config", {}) or {}
         tp = barrier.get("take_profit")
         if amount is None or tp is None:
             return None
@@ -606,7 +617,7 @@ class TradingAgent:
             return
         try:
             cfg = arguments.get("executor_config", {}) or {}
-            etype = str(cfg.get("type", ""))
+            etype = str(arguments.get("executor_type") or cfg.get("type") or "")
             experiment = self.analytics.get_active_experiment()
             self.analytics.record_decision_event(
                 mode=self.guard.mode,
@@ -623,6 +634,47 @@ class TradingAgent:
             )
         except Exception:
             pass  # analytics must never break the trading path
+
+    async def _intel_context(self) -> dict[str, Any] | None:
+        """Build the multi-source intelligence snapshot for the LLM.
+
+        Best-effort on the analytics path: any failure returns None and the
+        agent runs with market data only (never blocked by intel outages).
+        """
+        try:
+            from intelligence.snapshot import build_snapshot
+            from intelligence.store import IntelligenceStore
+
+            symbols = self.guard.config["safety"].get("allowed_base_assets",
+                                                      ["BTC", "ETH"])
+            symbols = [s for s in symbols if not s.startswith("U")]
+            # 24h change per symbol for the narrative engine (quick candles
+            # call on the market-data probe connector)
+            market: dict[str, dict[str, Any]] = {}
+            for sym in symbols:
+                try:
+                    data = await self._hb_rest("POST", "/market-data/candles", {
+                        "connector_name": os.getenv("MARKET_PROBE_CONNECTOR",
+                                                    "hyperliquid_perpetual"),
+                        "trading_pair": f"{sym}-USD",
+                        "interval": "1h", "max_records": 30,
+                    })
+                    rows = data.get("candles", data) if isinstance(data, dict) else data
+                    closes = [float(c["close"]) for c in (rows or [])]
+                    if len(closes) >= 25:
+                        market[sym] = {
+                            "24h_change_pct": round((closes[-1] / closes[-25] - 1) * 100, 2)}
+                except Exception:
+                    continue
+            store = IntelligenceStore(
+                os.getenv("INTELLIGENCE_DB", "data/intelligence.db"))
+            try:
+                snapshot = build_snapshot(store, symbols, market=market)
+            finally:
+                store.close()
+            return snapshot.for_llm()
+        except Exception:
+            return None
 
     async def _hb_rest(self, method: str, path: str, payload: dict[str, Any]) -> Any:
         import httpx

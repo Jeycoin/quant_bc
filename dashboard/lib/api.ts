@@ -274,6 +274,69 @@ export type LabMetrics = {
   attribution: { strategy: AttributionRow[]; regime: AttributionRow[] };
 };
 
+export type NarrativeRow = {
+  id: number;
+  ts: number;
+  symbol: string | null;
+  name: string;
+  strength: number | null;
+  novelty: number | null;
+  social_momentum: number | null;
+  price_confirmation: number | null;
+  onchain_confirmation: number | null;
+  confidence: number | null;
+  evidence: string;
+};
+
+export type NewsRow = {
+  id: number;
+  ts: number;
+  source: string;
+  title: string;
+  summary: string;
+  asset: string | null;
+  category: string;
+  severity: number;
+  relevance: number;
+  url: string;
+};
+
+export type RejectionRow = {
+  decision_id: string;
+  ts: number;
+  symbol: string | null;
+  action: string | null;
+  strategy: string | null;
+  risk_status: string | null;
+  rejection_reason: string | null;
+  experiment_id: string | null;
+};
+
+export type IntelOverview = {
+  available?: boolean;
+  reason?: string;
+  generated_at?: number;
+  social?: {
+    market?: {
+      fear_greed?: { value: number; classification: string | null; age_minutes: number | null };
+      sentiment_change_1d?: { value: number; age_minutes: number | null };
+    };
+    symbols?: Record<string, Record<string, { value: number; age_minutes: number | null }>>;
+  };
+  onchain?: Record<string, Record<string, { value: number; age_minutes: number | null; change_pct_1d?: number }>>;
+  news?: Array<{
+    title: string; asset: string | null; category: string; severity: number;
+    source: string; ts: number; age_minutes?: number;
+  }>;
+  narratives?: Array<{
+    name: string; symbol: string | null; strength: number; novelty: number;
+    social_momentum: number; price_confirmation: number;
+    onchain_confirmation: number; confidence: number; evidence: string[];
+  }>;
+  grid_protection?: Record<string, { state: string; reasons: string[] }>;
+  meta?: Record<string, unknown>;
+};
+
 export type Executor = {
   executor_id: string;
   executor_type: string;
@@ -389,6 +452,19 @@ export const api = {
     ),
   labReport: (experimentId: string) =>
     get<{ data: string }>(`/api/lab/report/${experimentId}`),
+  intelOverview: () => get<IntelOverview>("/api/intel/overview"),
+  intelNarratives: (symbol?: string, hours = 24) =>
+    get<{ data: NarrativeRow[] }>(
+      `/api/intel/narratives?hours=${hours}${symbol ? `&symbol=${symbol}` : ""}`
+    ),
+  intelNews: (asset?: string, hours = 24) =>
+    get<{ data: NewsRow[] }>(
+      `/api/intel/news?hours=${hours}${asset ? `&asset=${asset}` : ""}`
+    ),
+  intelRejections: (hours = 168) =>
+    get<{ summary: Record<string, number>; recent: RejectionRow[] }>(
+      `/api/intel/rejections?hours=${hours}`
+    ),
 };
 
 export const API_BASE_URL = API_BASE;

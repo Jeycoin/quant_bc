@@ -29,6 +29,7 @@ from dashboard_api.events import analysis_to_event, decision_to_event, review_to
 from dashboard_api.hummingbot import EndpointNotAllowed, ReadOnlyHummingbot
 from dashboard_api.lab import analytics_db_ok
 from dashboard_api.lab import router as lab_router
+from dashboard_api.intel import router as intel_router
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -95,6 +96,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(lab_router)
+app.include_router(intel_router)
 
 hb = ReadOnlyHummingbot()
 
@@ -173,6 +175,29 @@ async def get_health() -> dict[str, Any]:
             checks["experiment"] = {"ok": True, "detail": "no active experiment"}
     except Exception as exc:
         checks["experiment"] = {"ok": False, "detail": str(exc)}
+
+    # intelligence layer: real check — DB reachable + freshest item age
+    try:
+        from intelligence.store import IntelligenceStore
+
+        istore = IntelligenceStore(str(REPO_ROOT / "data" / "intelligence.db"))
+        try:
+            news = istore.recent_news(hours=720, limit=1)
+            signals = istore.recent_signals(hours=720)[:1]
+        finally:
+            istore.close()
+        latest = max([r["ts"] for r in (news + signals)], default=None)
+        if latest is None:
+            checks["intelligence"] = {"ok": False, "detail": "no data collected yet"}
+        else:
+            age_h = (time.time() - latest) / 3600
+            checks["intelligence"] = {
+                "ok": age_h < 2,
+                "detail": f"freshest item {age_h:.1f}h old"
+                          + (" (collector stale)" if age_h >= 2 else ""),
+            }
+    except Exception as exc:
+        checks["intelligence"] = {"ok": False, "detail": str(exc)}
 
     return {"mode": trading_mode(), "checks": checks,
             "ok": all(c["ok"] for c in checks.values())}

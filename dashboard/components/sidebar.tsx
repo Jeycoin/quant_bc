@@ -12,6 +12,7 @@ import {
   BookOpen,
   Brain,
   FlaskConical,
+  Radar,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -25,6 +26,7 @@ const NAV = [
   { href: "/journal", label: "Trade Journal", icon: BookOpen },
   { href: "/memory", label: "Memory", icon: Brain },
   { href: "/lab", label: "Quant Lab", icon: FlaskConical },
+  { href: "/intel", label: "Intelligence", icon: Radar },
 ];
 
 export function Sidebar() {
