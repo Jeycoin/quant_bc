@@ -142,3 +142,25 @@ and never mix baseline trades into agent regime attribution
 (analytics/queries.attribution gained a source filter; report renders the
 baseline table from summary_json). scripts/backfill_replay_summary.py
 rebuilds summaries for older replay experiments without LLM calls.
+
+## DeepSeek balance outage (2026-10-03 ~03:00)
+
+The 90d replay (exp-7881c7f72f2f) hit **402 Insufficient Balance** from
+DeepSeek partway through (~decision 175 of ~2160). All later decision
+points fell back to no-trade, so the run is marked `invalid` — do not
+analyze it. The displayed "-0.07% / 14 trades" is the fallback artifact,
+not agent behavior.
+
+Also discovered: all local background processes froze when the machine
+slept (~18:30 10-02 → 03:04 10-03); Windows kept them as zombies with
+~0 CPU. Recovery = kill + restart; dashboards (uvicorn/next) survived
+but both python loops and the replay needed a restart.
+
+Fallback action: `.env` switched to GLM `glm-5.3-flash` (DeepSeek lines
+preserved as comments; restore after top-up). Live loop continues on GLM
+— decision events carry `llm_model`, so the model switch is auditable
+per decision. The 90d replay is postponed until DeepSeek is recharged
+(GLM at ~66s/decision point would need ~40h for 90d).
+
+Lesson for ops: long replays should checkpoint — a `--resume` flag for
+backtest_agent.py is now the top robustness TODO.
