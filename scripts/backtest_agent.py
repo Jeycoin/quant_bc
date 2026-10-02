@@ -205,6 +205,7 @@ async def main() -> None:
     grids: dict[str, SimGrid] = {}
     equity_curve: list[dict] = []
     trade_count = 0
+    consecutive_llm_errors = 0
 
     timeline = [c["timestamp"] for c in candles["BTC"] if start_ts <= c["timestamp"] <= end_ts]
     btc_by_ts = {c["timestamp"]: c for c in candles["BTC"]}
@@ -275,8 +276,19 @@ async def main() -> None:
             resp = await llm.create(system=system, tools=[],
                                     messages=[{"role": "user", "content": user_msg}])
             answer = resp.text
+            consecutive_llm_errors = 0
         except Exception as exc:
+            msg = str(exc)
             print(f"  [{time.strftime('%m-%d %H:%M', time.gmtime(ts))}] LLM error: {exc}")
+            consecutive_llm_errors += 1
+            fatal = any(s in msg for s in ("402", "Insufficient Balance",
+                                           "401", "Authentication", "invalid_api_key"))
+            if fatal or consecutive_llm_errors >= 10:
+                store.end_experiment(exp_id, status="failed")
+                store.close()
+                raise SystemExit(
+                    f"fatal LLM error after {consecutive_llm_errors} consecutive failures; "
+                    f"experiment {exp_id} marked failed: {msg[:200]}")
             continue
         blocks = extract_analysis_blocks(answer)
         if not blocks:
