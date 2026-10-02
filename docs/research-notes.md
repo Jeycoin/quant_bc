@@ -100,3 +100,45 @@ Conclusions:
    This is exactly the regime-selection value the agent is meant to add.
 3. Backtest limits: 1h candle granularity, no intrabar path, no slippage
    model, flat fee — use for parameter sanity checks, not precision.
+
+## 30d agent replay — DeepSeek-V4.1-Flash (2026-10-02, exp-ac0ec11406f7)
+
+First full-window replay after the v0.4 cost/risk layer. 713 decision
+points (BTC+ETH, every 2h), 2026-09-03 → 10-02 (29d replayed).
+
+| | agent | fixed grid (BTC/ETH) | fixed trend | buy&hold |
+|---|---|---|---|---|
+| net PnL | **+$16.92** (+0.17%) | +$4.94 / +$11.03 | +$4.05 / +$5.92 | +$22.22 / +$26.22 |
+
+- 713 decisions: WATCH 460, WAIT 191, LONG 46, SHORT 9 — the agent stays
+  out 91% of the time; trading discipline works.
+- Cost Validator effect vs the 7d GLM replay (net -0.02%): grid trades now
+  net-positive ($3.94 net on $9.89 fees — still a 2.5x fee drag, but no
+  longer structurally negative). Position executor drives PnL (+$12.98 net).
+- Regime attribution: BREAKOUT +$16.37 (75% win) is the earner;
+  TRENDING_BULL -$0.27 and TRENDING_BEAR -$3.12 lag — trend entries remain
+  the weak spot.
+- Buy&hold beat everything (+$22-26 per $200) — the window was a sustained
+  uptrend. The honest read: the agent adds drawdown control (maxDD 0.23%)
+  and fee discipline, not yet raw return vs passive in a bull leg.
+- Caveat: DeepSeek training cutoff unknown, replayed window may be in
+  training data — contamination cannot be ruled out. Forward testnet
+  results (exp-d713167f1466) remain the clean evidence.
+- Report: docs/reports/bt-replay-30d-deepseek.md
+
+## WSL2 mirrored-mode incident (2026-10-02)
+
+After a 4d shutdown, containers lost all egress (TCP handshake ok, TLS
+stalled) while the WSL VM itself was fine. Root cause: .wslconfig had
+`networkingMode=mirrored`, which breaks docker bridge NAT. Fix:
+`networkingMode=NAT` (backup at ~/.wslconfig.bak-20261002). Hummingbot
+market data recovered immediately.
+
+## Replay summary persistence (2026-10-02)
+
+experiments.summary_json (additive column) now stores replayed window,
+agent equity metrics and all three baselines, so reports render offline
+and never mix baseline trades into agent regime attribution
+(analytics/queries.attribution gained a source filter; report renders the
+baseline table from summary_json). scripts/backfill_replay_summary.py
+rebuilds summaries for older replay experiments without LLM calls.

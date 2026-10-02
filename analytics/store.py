@@ -125,6 +125,9 @@ class AnalyticsStore:
             self._conn.execute("ALTER TABLE decision_events ADD COLUMN rejection_reason TEXT")
         if "llm_model" not in decision_cols:
             self._conn.execute("ALTER TABLE decision_events ADD COLUMN llm_model TEXT")
+        exp_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(experiments)")}
+        if "summary_json" not in exp_cols:
+            self._conn.execute("ALTER TABLE experiments ADD COLUMN summary_json TEXT")
         self._conn.commit()
 
     # ------------------------------------------------------------- decisions
@@ -298,6 +301,15 @@ class AnalyticsStore:
         self._conn.execute(
             "UPDATE experiments SET status = ?, ended_at = ? WHERE experiment_id = ?",
             (status, time.time(), experiment_id),
+        )
+        self._conn.commit()
+
+    def set_experiment_summary(self, experiment_id: str, summary: dict[str, Any]) -> None:
+        """Persist a structured result summary (e.g. replay equity metrics and
+        baseline comparison) so reports stay generatable offline."""
+        self._conn.execute(
+            "UPDATE experiments SET summary_json = ? WHERE experiment_id = ?",
+            (json.dumps(summary, ensure_ascii=False), experiment_id),
         )
         self._conn.commit()
 

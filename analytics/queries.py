@@ -134,6 +134,7 @@ def attribution(
     db_path: str,
     group_by: str,
     experiment_id: str | None = None,
+    source: str | None = None,
 ) -> list[dict[str, Any]]:
     """PnL / win rate / trade count grouped by strategy or regime_at_entry."""
     if group_by not in ("strategy", "regime_at_entry"):
@@ -149,12 +150,18 @@ def attribution(
                    ) AS win_rate
         FROM trade_events
     """
-    params: tuple = ()
+    conds: list[str] = []
+    params: list[Any] = []
     if experiment_id:
-        sql += " WHERE experiment_id = ?"
-        params = (experiment_id,)
+        conds.append("experiment_id = ?")
+        params.append(experiment_id)
+    if source:
+        conds.append("source = ?")
+        params.append(source)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
     sql += f" GROUP BY bucket ORDER BY total_pnl_quote DESC"
-    return _rows(db_path, sql, params)
+    return _rows(db_path, sql, tuple(params))
 
 
 def list_experiments(db_path: str) -> list[dict[str, Any]]:

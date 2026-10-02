@@ -468,6 +468,16 @@ async def main() -> None:
             "buy_hold_pnl": round(GRID_SIZE * (last / first - 1), 4),
         }
 
+    store.set_experiment_summary(exp_id, {
+        "replayed_window": {"start_ts": start_ts, "end_ts": end_ts},
+        "start_equity": equity_curve[0]["equity"],
+        "final_equity": equity_curve[-1]["equity"],
+        "agent_equity_metrics": agent_eq,
+        "trade_count": trade_count,
+        "baselines": baselines,
+        "baseline_notional": {"fixed_grid": GRID_SIZE, "trend": POSITION_SIZE,
+                              "buy_hold": GRID_SIZE},
+    })
     store.end_experiment(exp_id)
     store.close()
 

@@ -62,6 +62,13 @@ def generate_report(db_path: str, experiment_id: str) -> str:
     ended = exp.get("ended_at") or time.time()
     days = (ended - started) / 86400
 
+    summary: dict[str, Any] = {}
+    if exp.get("summary_json"):
+        try:
+            summary = json.loads(exp["summary_json"])
+        except (TypeError, json.JSONDecodeError):
+            summary = {}
+
     decisions = queries.list_decision_events(db_path, experiment_id=experiment_id, limit=10000)
     trades = queries.list_trade_events(db_path, experiment_id=experiment_id, limit=10000)
     reviews = [
@@ -69,9 +76,10 @@ def generate_report(db_path: str, experiment_id: str) -> str:
         if any(t["executor_id"] == r.get("execution_id") for t in trades)
     ]
     dist = queries.decision_distribution(db_path, experiment_id)
-    by_strategy = queries.attribution(db_path, "strategy", experiment_id)
-    by_regime = queries.attribution(db_path, "regime_at_entry", experiment_id)
+    by_strategy = queries.attribution(db_path, "strategy", experiment_id, source="agent")
+    by_regime = queries.attribution(db_path, "regime_at_entry", experiment_id, source="agent")
     equity = m.equity_metrics(_equity_snapshots(started, ended))
+    replay_eq = summary.get("agent_equity_metrics") or {}
     trading = m.trading_metrics(trades)
 
     agent_trades = [t for t in trades if t.get("source") == "agent"]
@@ -94,13 +102,27 @@ def generate_report(db_path: str, experiment_id: str) -> str:
         if d.get("market_regime"):
             regimes[d["market_regime"]] = regimes.get(d["market_regime"], 0) + 1
 
+    window = summary.get("replayed_window") or {}
+    if window.get("start_ts") and window.get("end_ts"):
+        w_days = (window["end_ts"] - window["start_ts"]) / 86400
+        period_line = (
+            f"- replayed window: {time.strftime('%Y-%m-%d %H:%M', time.localtime(window['start_ts']))}"
+            f" → {time.strftime('%Y-%m-%d %H:%M', time.localtime(window['end_ts']))} ({w_days:.1f} days)\n"
+            f"- executed (wall clock): {time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}"
+            f" → {time.strftime('%Y-%m-%d %H:%M', time.localtime(ended))}"
+        )
+    else:
+        period_line = (
+            f"- period: {time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}"
+            f" → {time.strftime('%Y-%m-%d %H:%M', time.localtime(ended))} ({days:.1f} days)"
+        )
+
     lines = [
         f"# Experiment Report: {exp['name']}",
         "",
         f"- experiment_id: `{experiment_id}`",
         f"- status: {exp['status']}",
-        f"- period: {time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}"
-        f" → {time.strftime('%Y-%m-%d %H:%M', time.localtime(ended))} ({days:.1f} days)",
+        period_line,
         f"- symbols: {exp.get('symbols')}",
         f"- strategies: {exp.get('strategies')}",
         f"- versions: agent={exp.get('agent_version')} prompt={exp.get('prompt_version')}"
@@ -147,6 +169,16 @@ def generate_report(db_path: str, experiment_id: str) -> str:
         "",
         f"- max drawdown: {_pct((equity['max_drawdown_pct'] or 0) / 100 if equity['max_drawdown_pct'] is not None else None)}",
         f"- equity snapshots: {equity['snapshot_count']}",
+        *(
+            [
+                f"- replay equity: start {_usd(summary.get('start_equity'))}"
+                f" → final {_usd(summary.get('final_equity'))}"
+                f" · return {_pct(replay_eq.get('total_return'))}"
+                f" · maxDD {_pct((replay_eq.get('max_drawdown_pct') or 0) / 100)}"
+                f" · sharpe-like {replay_eq.get('sharpe_like') if replay_eq.get('sharpe_like') is not None else '—'}",
+            ]
+            if replay_eq else []
+        ),
         "",
         "## AI Decision Quality",
         "",
@@ -163,6 +195,22 @@ def generate_report(db_path: str, experiment_id: str) -> str:
         f"| expectancy | {_usd(comparison['ai_assisted']['expectancy'])} | {_usd(comparison['baseline']['expectancy'])} |",
         f"| avg holding | {_hours(comparison['ai_assisted']['avg_holding_s'])} | {_hours(comparison['baseline']['avg_holding_s'])} |",
         "",
+        *(
+            [
+                "### Replay baselines (same window)",
+                "",
+                "| symbol | fixed grid | fixed trend | buy & hold |",
+                "|---|---|---|---|",
+                *[
+                    f"| {sym} | {_usd(b.get('fixed_grid_pnl'))}"
+                    f" | {_usd(b.get('fixed_trend_pnl'))} ({b.get('fixed_trend_trades')} trades)"
+                    f" | {_usd(b.get('buy_hold_pnl'))} |"
+                    for sym, b in (summary.get("baselines") or {}).items()
+                ],
+                "",
+            ]
+            if summary.get("baselines") else []
+        ),
         "> Caution (§36): a higher AI PnL does not prove AI is better — consider"
         " sample size, period, market regime, fees, slippage and parameter"
         " differences before drawing conclusions.",
