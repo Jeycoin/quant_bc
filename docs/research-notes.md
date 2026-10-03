@@ -164,3 +164,24 @@ per decision. The 90d replay is postponed until DeepSeek is recharged
 
 Lesson for ops: long replays should checkpoint — a `--resume` flag for
 backtest_agent.py is now the top robustness TODO.
+
+## 90d dual-model replay (2026-10-03)
+
+Two 90d replays completed the sample:
+
+- **GLM-4.5-flash (thinking off), full 90d** (exp-eb401d316df2): net -0.27%,
+  82 trades, 92% WATCH. Grid -18.15 (fees 30.61). Conservative.
+- **DeepSeek-flash, 86.9/90d** (exp-23f2df348a8e): net -0.10%, 174 trades,
+  fees 41.96 (~57% of gross). Ran out of balance at replayed 09-30; fail-fast
+  (added today) marked it failed cleanly — no fallback pollution. The missing
+  3 days are covered by the 30d run.
+
+Cross-window regime attribution is now consistent (7d/30d/90d, both models):
+BREAKOUT is the only reliably profitable regime (+3.84 / +16.37 / +34.05);
+TRENDING_BEAR shorts lose most (14% win over 90d); RANGING grids are
+net-negative at scale due to fees. Agent beats the fixed-trend baseline
+(-18/-31) but not fixed grid or buy&hold.
+
+Live loop switched to GLM-4.5-flash with thinking disabled (8.5s/decision)
+to preserve the near-zero DeepSeek balance; llm_model column tracks it.
+Full write-up: docs/framework-analysis-v0.4.md

@@ -127,6 +127,9 @@ class OpenAICompatClient:
             "max_tokens": MAX_TOKENS,
             "messages": oai_messages,
         }
+        extra_body = os.getenv("LLM_EXTRA_BODY")
+        if extra_body:
+            kwargs["extra_body"] = json.loads(extra_body)
         if tools:
             kwargs["tools"] = [
                 {
