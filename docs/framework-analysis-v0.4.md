@@ -45,7 +45,7 @@ On-chain(Blockchain.info)  Social(FearGreed/LunarCrush*)  News(RSS)
 | exp-a856ad913012 | 7d 回放 | GLM（v0.3 prompt） | 09-20→09-27 | completed | **-$1.64** |
 | exp-ac0ec11406f7 | 30d 回放 | deepseek-flash | 09-03→10-02 | completed | **+$16.92** |
 | exp-eb401d316df2 | 90d 回放 | glm-4.5-flash（关思考） | 07-05→10-03 | completed | **-$27.38（-0.27%）** |
-| exp-23f2df348a8e | 90d 回放（86.9/90 天） | deepseek-flash | 07-05→09-30 | failed（402 尾部中断，数据完整） | **-$10.15（-0.10%）** |
+| exp-23f2df348a8e | 90d 回放（完整 91 天） | deepseek-flash | 07-05→10-04 | completed（402 中断后经断点续跑补齐，见 §3.3） | **-$13.85（-0.14%）** |
 | exp-d713167f1466 | 7d testnet 前瞻 | GLM→DeepSeek→GLM | 09-27 起（含 4d 停机） | running | $0（0 成交） |
 | exp-c4cc23730c9d / exp-baa33d326dcf | 30d 回放 | GLM/DeepSeek | — | aborted（关机中断） | — |
 | exp-0a51b3661c70 | 90d 回放 | deepseek-flash | — | aborted（休眠冻结） | — |
@@ -89,11 +89,12 @@ On-chain(Blockchain.info)  Social(FearGreed/LunarCrush*)  News(RSS)
 - 仓位 12 笔 -7.61，胜率 25%
 - 决策分布：92% WATCH —— GLM 比 DeepSeek 更保守
 
-**DeepSeek 90d 部分**（exp-23f2df348a8e，07-05→09-30 共 86.9 天，2057 决策点；
-尾部 3 天因余额耗尽中断，fail-fast 保住数据完整性，该窗口已被 30d 实验覆盖）：
-- 净 **-0.10%**，maxDD 0.42%，174 笔，profit factor 0.94
-- 总费用 **41.96 USDT**（若零费用，毛利约 +32）——费用是这个框架的第一大户
-- 基线：固定网格 +16.09/+7.14 · 固定趋势 **-18.32/-30.64** · 买入持有 +69.80/+103.42
+**DeepSeek 90d 全程**（exp-23f2df348a8e，07-05→10-04 共 91 天，2144 决策点）：
+- 净 **-0.14%**，maxDD 0.42%，182 笔，profit factor 0.92
+- 总费用 **61.59 USDT**（若零费用，毛利约 +48）——费用是这个框架的第一大户
+- 基线：固定网格 +17.15/+8.07 · 固定趋势 **-16.49/-28.44** · 买入持有 +70.62/+105.62
+- 尾部（09-30→10-04）由断点续跑补齐：镜像重建 176 笔历史交易（零 LLM 成本），再实时续跑 46 个决策点；新增 4 笔仓位全部小亏（-2.16/-2.16/-1.77/-1.62），两个网格持有至结算（+0.05/+0.15）
+- 注：首次续跑因 candle 缺口导致决策相位漂移（奇偶小时错位）产生过 24 行污染数据，已清理并修复为按记录时间戳精确对齐（`--resume-exp`）
 
 ### 3.4 跨窗口综合（本报告最重要的结论）
 
@@ -102,14 +103,14 @@ On-chain(Blockchain.info)  Social(FearGreed/LunarCrush*)  News(RSS)
 | Regime | 7d GLM | 30d DeepSeek | 90d DeepSeek | 结论 |
 |---|---|---|---|---|
 | BREAKOUT | +3.84 | +16.37 (75%) | +34.05 (54%) | **唯一稳定的正贡献来源** |
-| RANGING（网格） | -5.00 | +3.94 | -12.04 | 费用敏感，整体不可持续 |
-| TRENDING_BULL | -0.48 | -0.27 | -14.33 (34%) | 稳定亏损 |
-| TRENDING_BEAR | — | -3.12 | -17.81 (**14%**) | 最差：熊市做空反而亏最多 |
+| RANGING（网格） | -5.00 | +3.94 | -8.04 (50%) | 费用敏感，整体不可持续 |
+| TRENDING_BULL | -0.48 | -0.27 | -18.65 (33%) | 稳定亏损 |
+| TRENDING_BEAR | — | -3.12 | -21.19 (**12.5%**) | 最差：熊市做空反而亏最多 |
 
 1. **AI 的超额收益全部来自 BREAKOUT 识别**——这在 3 个窗口、2 个模型上复现，是当前最有统计信心的发现
-2. **趋势跟随在两个模型上都是净亏损**；TRENDING_BEAR 做空胜率仅 14%——追空在牛市大窗口里被反复止损
-3. **Agent 显著跑赢固定趋势基线**（-0.1% vs -18/-31），但跑输固定网格和买入持有——AI 当前的增量是"避免最差情况"，还不是"增强收益"
-4. 费用占毛利的比例：30d 约 48%，90d 约 57%——**maker 单改造和网格间距自适应是收益侧最大杠杆**
+2. **趋势跟随在两个模型上都是净亏损**；TRENDING_BEAR 做空胜率仅 12.5%——追空在牛市大窗口里被反复止损
+3. **Agent 显著跑赢固定趋势基线**（-0.14% vs -16/-28），但跑输固定网格和买入持有——AI 当前的增量是"避免最差情况"，还不是"增强收益"
+4. 费用占毛利的比例：30d 约 48%，90d 约 56%——**maker 单改造和网格间距自适应是收益侧最大杠杆**
 
 ### 3.5 7d testnet 前瞻（真实 API，运行中）
 
@@ -135,7 +136,7 @@ On-chain(Blockchain.info)  Social(FearGreed/LunarCrush*)  News(RSS)
 | 报告离线可生成（不依赖交易栈在线） | ✅ |
 | 回放 fail-fast（402/401/连续失败即中止，不静默空跑） | ✅（本次新增） |
 | 消融实验（INTEL_DISABLED / INTEL_SECTIONS） | ✅ 开关就绪，待前瞻数据积累 |
-| 模型 A/B | ✅ 首个对照完成：DeepSeek-90d -0.10% vs GLM-90d -0.27%（同窗口，DeepSeek 交易更积极 174 vs 82 笔） |
+| 模型 A/B | ✅ 首个对照完成：DeepSeek-90d -0.14% vs GLM-90d -0.27%（同窗口，DeepSeek 交易更积极 182 vs 82 笔） |
 
 ---
 
@@ -153,9 +154,9 @@ On-chain(Blockchain.info)  Social(FearGreed/LunarCrush*)  News(RSS)
 
 ## 6. 当前最大的三个改进方向（按证据强度排序）
 
-1. **费用结构**（证据：90d 费用 41.96 USDT，占毛利 57%；网格在 RANGING 净利为负）
+1. **费用结构**（证据：90d 费用 61.59 USDT，占毛利 56%；网格在 RANGING 净利为负）
    —— maker 单比例提升、网格间距与波动率自适应、taker 入场改限价，是收益侧最大杠杆
-2. **趋势/做空入场质量**（证据：TRENDING_BEAR 14% 胜率 × 14 笔，两个模型一致亏损）
+2. **趋势/做空入场质量**（证据：TRENDING_BEAR 12.5% 胜率 × 16 笔，两个模型一致亏损）
    —— 考虑在 prompt 层提高 TRENDING_BEAR 做空的证据门槛，或先禁用做空方向直到样本足够
 3. **前瞻数据积累**（证据：所有干净结论都需要样本；7d 前瞻因停机只攒了 38 决策）
    —— 保持 testnet loop 不间断运行，比任何参数调整都重要
@@ -164,13 +165,13 @@ On-chain(Blockchain.info)  Social(FearGreed/LunarCrush*)  News(RSS)
 
 - 不因 BREAKOUT 盈利而降低其入场门槛（虽然是三窗口复现，但仍是 regime 条件而非独立样本）
 - 不因趋势策略亏损而永久关闭——先在回放里验证"提高做空门槛"的假设
-- 不因单窗口结果更换模型——DeepSeek 与 GLM 的 90d 差异（-0.10% vs -0.27%）不足以区分模型能力
+- 不因单窗口结果更换模型——DeepSeek 与 GLM 的 90d 差异（-0.14% vs -0.27%）不足以区分模型能力
 
 ---
 
 ## 7. 下一步
 
-1. DeepSeek 充值后重跑一次完整 90d（当前 exp-23f2df348a8e 缺最后 3 天，已被 30d 实验覆盖但非同次运行）
-2. 给 backtest_agent.py 加 checkpoint/resume（本次 3 次中断的直接教训）
+1. ~~DeepSeek 充值后重跑完整 90d~~ ✅ 2026-10-04 经断点续跑补齐（91 天，completed）
+2. ~~给 backtest_agent.py 加 checkpoint/resume~~ ✅ 2026-10-04 实现 `--resume-exp`（镜像重建 + 时间戳精确对齐）
 3. 前瞻实验攒满 7 个完整运行日后出首份干净样本报告
 4. 实验"maker-only 网格"与"TRENDING_BEAR 禁空"两个假设——都有明确的回放证据支持，且可用现有框架离线验证，不影响实时链路

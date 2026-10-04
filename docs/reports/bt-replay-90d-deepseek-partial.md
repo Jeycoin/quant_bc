@@ -1,5 +1,9 @@
 # Experiment Report: bt-replay-90d
 
+> **Superseded 2026-10-04**: this experiment was resumed via `--resume-exp` and
+> completed at 91.0 days. Final report: [bt-replay-90d-deepseek.md](bt-replay-90d-deepseek.md).
+> This file is kept as the historical record of the interrupted run.
+
 - experiment_id: `exp-23f2df348a8e`
 - status: failed
 - replayed window: 2026-07-05 23:00 → 2026-09-30 20:00 (86.9 days)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -41,8 +42,12 @@ async def fetch_candles(coin: str, days: int) -> list[dict]:
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - days * 86400_000
     candles: dict[int, dict] = {}
+    # trust_env=False: the Windows system proxy (registry) must not silently
+    # route experiment data fetches; set MARKET_DATA_PROXY in .env if a proxy
+    # is genuinely required
     async with httpx.AsyncClient(
-        base_url="https://api.hyperliquid.xyz", timeout=30.0
+        base_url="https://api.hyperliquid.xyz", timeout=30.0,
+        trust_env=False, proxy=os.environ.get("MARKET_DATA_PROXY") or None,
     ) as client:
         cursor = start_ms
         while cursor < end_ms:

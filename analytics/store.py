@@ -322,5 +322,32 @@ class AnalyticsStore:
         self._conn.row_factory = None
         return dict(row) if row else None
 
+    def get_experiment(self, experiment_id: str) -> dict[str, Any] | None:
+        self._conn.row_factory = sqlite3.Row
+        row = self._conn.execute(
+            "SELECT * FROM experiments WHERE experiment_id = ?",
+            (experiment_id,),
+        ).fetchone()
+        self._conn.row_factory = None
+        return dict(row) if row else None
+
+    def list_decision_events(self, experiment_id: str) -> list[dict[str, Any]]:
+        self._conn.row_factory = sqlite3.Row
+        rows = self._conn.execute(
+            "SELECT * FROM decision_events WHERE experiment_id = ? ORDER BY ts",
+            (experiment_id,),
+        ).fetchall()
+        self._conn.row_factory = None
+        return [dict(r) for r in rows]
+
+    def list_trade_events(self, experiment_id: str) -> list[dict[str, Any]]:
+        self._conn.row_factory = sqlite3.Row
+        rows = self._conn.execute(
+            "SELECT * FROM trade_events WHERE experiment_id = ? ORDER BY ts_open",
+            (experiment_id,),
+        ).fetchall()
+        self._conn.row_factory = None
+        return [dict(r) for r in rows]
+
     def close(self) -> None:
         self._conn.close()

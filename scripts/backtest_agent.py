@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -146,8 +147,10 @@ def _summarize(candles: list[dict], upto_ts: float) -> dict | None:
 
 
 async def fetch_funding(coin: str, start_ms: int) -> dict[float, float]:
+    # trust_env=False: see fetch_candles in backtest_grid.py
     async with httpx.AsyncClient(base_url="https://api.hyperliquid.xyz",
-                                 timeout=30.0) as client:
+                                 timeout=30.0, trust_env=False,
+                                 proxy=os.environ.get("MARKET_DATA_PROXY") or None) as client:
         resp = await client.post("/info", json={
             "type": "fundingHistory", "coin": coin, "startTime": start_ms,
         })
@@ -159,6 +162,10 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Agent replay backtest")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--decision-hours", type=int, default=2)
+    parser.add_argument("--resume-exp", default=None,
+                        help="resume an interrupted replay experiment: rebuild "
+                             "portfolio state from its recorded decisions without "
+                             "LLM calls, then continue live decisions up to now")
     args = parser.parse_args()
 
     if sys.platform == "win32":
@@ -166,35 +173,77 @@ async def main() -> None:
 
     end_ts = int(time.time())
     start_ts = end_ts - args.days * 86400
+
+    store = AnalyticsStore(str(REPO_ROOT / "data" / "analytics.db"))
+    recorded_blocks: dict[float, list[dict]] = {}
+    recorded_by_ts_sym: dict[tuple[float, str], dict] = {}
+    recorded_closes: dict[float, list[dict]] = {}
+    resume_last_ts: float | None = None
+    exp_id: str | None = None
+    if args.resume_exp:
+        exp = store.get_experiment(args.resume_exp)
+        if not exp:
+            raise SystemExit(f"experiment {args.resume_exp} not found")
+        exp_id = args.resume_exp
+        events = store.list_decision_events(exp_id)
+        trades = store.list_trade_events(exp_id)
+        if not events:
+            raise SystemExit(f"experiment {exp_id} has no recorded decisions")
+        block_events = [e for e in events if e.get("symbol")]
+        if not block_events:
+            raise SystemExit(f"experiment {exp_id} has no recorded block decisions")
+        # NO_BLOCK rows carry wall-clock ts, not candle ts — only block events
+        # give reliable candle-aligned timestamps for the resume boundary
+        resume_last_ts = max(float(e["ts"]) for e in block_events)
+        start_ts = int(min(float(e["ts"]) for e in block_events))
+        summary = json.loads(exp["summary_json"]) if exp.get("summary_json") else {}
+        for e in events:
+            if e.get("symbol"):
+                blk = {"symbol": e["symbol"], "regime": e.get("market_regime"),
+                       "action": e.get("action"), "confidence": e.get("confidence"),
+                       "strategy": e.get("strategy"), "evidence": e.get("evidence")}
+                recorded_blocks.setdefault(float(e["ts"]), []).append(blk)
+                recorded_by_ts_sym[(float(e["ts"]), e["symbol"])] = e
+        for t in trades:
+            # grid closes recorded at decision points let the rebuild mirror the
+            # original run exactly; REPLAY_END rows are settlement artifacts, and
+            # position exits are candle-driven (recomputed deterministically)
+            if t.get("ts_close") and t.get("close_type") != "REPLAY_END" \
+                    and t.get("strategy") == "grid_executor":
+                recorded_closes.setdefault(float(t["ts_close"]), []).append(t)
+        print(f"resuming {exp_id}: {len(events)} recorded decisions up to "
+              f"{time.strftime('%m-%d %H:%M', time.gmtime(resume_last_ts))} UTC, "
+              f"window start {time.strftime('%m-%d %H:%M', time.gmtime(start_ts))} UTC")
     warmup_ts = start_ts - 3 * 86400  # 3 extra days for context windows
+    fetch_days = int((end_ts - start_ts) / 86400) + 4
 
     print(f"fetching history {time.strftime('%m-%d %H:%M', time.localtime(start_ts))}"
           f" -> {time.strftime('%m-%d %H:%M', time.localtime(end_ts))} ...")
     candles = {}
     funding = {}
     for sym in SYMBOLS:
-        all_c = await fetch_candles(sym, args.days + 3)
+        all_c = await fetch_candles(sym, fetch_days)
         candles[sym] = all_c
         funding[sym] = await fetch_funding(sym, warmup_ts * 1000)
         print(f"  {sym}: {len(all_c)} candles, {len(funding[sym])} funding points")
 
     llm = create_llm_client()
-    store = AnalyticsStore(str(REPO_ROOT / "data" / "analytics.db"))
     versions = current_versions()
     import yaml
     with open(REPO_ROOT / "config" / "settings.yaml", "r", encoding="utf-8") as fh:
         settings = yaml.safe_load(fh)
     cost_validator = CostValidator.from_config(settings)
     risk_validator = RiskValidator.from_config(settings)
-    exp_id = store.start_experiment(
-        name=f"bt-replay-{args.days}d",
-        symbols=SYMBOLS,
-        strategies=["grid", "position"],
-        notes=f"historical forward-replay backtest; indicative only; model={llm.model}",
-        status="backtest",  # never 'running' — the live agent loop tags
-                            # decisions with the active 'running' experiment
-        **versions,
-    )
+    if exp_id is None:
+        exp_id = store.start_experiment(
+            name=f"bt-replay-{args.days}d",
+            symbols=SYMBOLS,
+            strategies=["grid", "position"],
+            notes=f"historical forward-replay backtest; indicative only; model={llm.model}",
+            status="backtest",  # never 'running' — the live agent loop tags
+                                # decisions with the active 'running' experiment
+            **versions,
+        )
     print(f"replay experiment: {exp_id}")
 
     system = (REPO_ROOT / "agent" / "prompts" / "trading_manager.md") \
@@ -210,8 +259,10 @@ async def main() -> None:
     timeline = [c["timestamp"] for c in candles["BTC"] if start_ts <= c["timestamp"] <= end_ts]
     btc_by_ts = {c["timestamp"]: c for c in candles["BTC"]}
     eth_by_ts = {c["timestamp"]: c for c in candles["ETH"]}
+    boundary_printed = False
 
     for i, ts in enumerate(timeline):
+        prefix = resume_last_ts is not None and ts <= resume_last_ts
         # 1. advance simulations with this candle
         for pos in list(positions):
             c = (btc_by_ts if pos.symbol == "BTC" else eth_by_ts).get(ts)
@@ -222,14 +273,15 @@ async def main() -> None:
                 pnl, reason, fees = result
                 cash += POSITION_SIZE + pnl
                 positions.remove(pos)
-                store.upsert_trade_event(
-                    executor_id=pos.executor_id, ts_open=pos.opened_ts, ts_close=ts,
-                    symbol=pos.symbol, strategy="position_executor", side=pos.side,
-                    status="CLOSED", close_type=reason, pnl_quote=pnl,
-                    gross_pnl=pnl + fees, fees_quote=fees,
-                    entry_fee=fees / 2, exit_fee=fees / 2,
-                    regime_at_entry=pos.regime_at_entry, source="agent",
-                    experiment_id=exp_id)
+                if not prefix:
+                    store.upsert_trade_event(
+                        executor_id=pos.executor_id, ts_open=pos.opened_ts, ts_close=ts,
+                        symbol=pos.symbol, strategy="position_executor", side=pos.side,
+                        status="CLOSED", close_type=reason, pnl_quote=pnl,
+                        gross_pnl=pnl + fees, fees_quote=fees,
+                        entry_fee=fees / 2, exit_fee=fees / 2,
+                        regime_at_entry=pos.regime_at_entry, source="agent",
+                        experiment_id=exp_id)
         for sym, g in list(grids.items()):
             c = (btc_by_ts if sym == "BTC" else eth_by_ts).get(ts)
             if c:
@@ -247,7 +299,16 @@ async def main() -> None:
         equity_curve.append({"ts": ts, "equity": equity})
 
         # 3. decision point
-        if i % args.decision_hours != 0:
+        if prefix:
+            # rebuild follows the recorded decision timestamps exactly — the
+            # original run stepped by candle index, which drifts off the hour
+            # phase when candles are missing, so index alignment is impossible
+            if float(ts) not in recorded_blocks and float(ts) not in recorded_closes:
+                continue
+        elif resume_last_ts is not None:
+            if (ts - resume_last_ts) % (args.decision_hours * 3600) != 0:
+                continue
+        elif i % args.decision_hours != 0:
             continue
         summaries = {s: _summarize(candles[s], ts) for s in SYMBOLS}
         if any(v is None for v in summaries.values()):
@@ -266,39 +327,52 @@ async def main() -> None:
                 "equity": round(equity, 2),
             },
         }
-        user_msg = (
-            "Historical replay. Data as of the stated time:\n"
-            + json.dumps(context, ensure_ascii=False)
-            + "\nAnalyze both symbols and output one analysis block per symbol."
-        )
-        decision_id = new_decision_id()
-        try:
-            resp = await llm.create(system=system, tools=[],
-                                    messages=[{"role": "user", "content": user_msg}])
-            answer = resp.text
-            consecutive_llm_errors = 0
-        except Exception as exc:
-            msg = str(exc)
-            print(f"  [{time.strftime('%m-%d %H:%M', time.gmtime(ts))}] LLM error: {exc}")
-            consecutive_llm_errors += 1
-            fatal = any(s in msg for s in ("402", "Insufficient Balance",
-                                           "401", "Authentication", "invalid_api_key"))
-            if fatal or consecutive_llm_errors >= 10:
-                store.end_experiment(exp_id, status="failed")
-                store.close()
-                raise SystemExit(
-                    f"fatal LLM error after {consecutive_llm_errors} consecutive failures; "
-                    f"experiment {exp_id} marked failed: {msg[:200]}")
-            continue
-        blocks = extract_analysis_blocks(answer)
-        if not blocks:
-            store.record_decision_event(
-                decision_id=decision_id, mode="BACKTEST", action="SCAN",
-                outcome_status="NO_BLOCK", market_context=context,
-                portfolio_context=context["portfolio"], experiment_id=exp_id,
-                llm_model=llm.model,
-                **versions)
-            continue
+        if prefix:
+            # rebuild phase: replay recorded decisions without LLM calls
+            blocks = recorded_blocks.get(float(ts), [])
+            for cl in recorded_closes.get(float(ts), []):
+                csym = cl["symbol"]
+                if csym in grids:
+                    g = grids.pop(csym)
+                    cash += g.sim.equity(px.get(csym) or summaries[csym]["price"])
+        else:
+            if resume_last_ts is not None and not boundary_printed:
+                boundary_printed = True
+                print(f"  [resume boundary] cash {cash:.2f}, "
+                      f"positions {len(positions)}, grids {list(grids)}")
+            user_msg = (
+                "Historical replay. Data as of the stated time:\n"
+                + json.dumps(context, ensure_ascii=False)
+                + "\nAnalyze both symbols and output one analysis block per symbol."
+            )
+            decision_id = new_decision_id()
+            try:
+                resp = await llm.create(system=system, tools=[],
+                                        messages=[{"role": "user", "content": user_msg}])
+                answer = resp.text
+                consecutive_llm_errors = 0
+            except Exception as exc:
+                msg = str(exc)
+                print(f"  [{time.strftime('%m-%d %H:%M', time.gmtime(ts))}] LLM error: {exc}")
+                consecutive_llm_errors += 1
+                fatal = any(s in msg for s in ("402", "Insufficient Balance",
+                                               "401", "Authentication", "invalid_api_key"))
+                if fatal or consecutive_llm_errors >= 10:
+                    store.end_experiment(exp_id, status="failed")
+                    store.close()
+                    raise SystemExit(
+                        f"fatal LLM error after {consecutive_llm_errors} consecutive failures; "
+                        f"experiment {exp_id} marked failed: {msg[:200]}")
+                continue
+            blocks = extract_analysis_blocks(answer)
+            if not blocks:
+                store.record_decision_event(
+                    decision_id=decision_id, mode="BACKTEST", action="SCAN",
+                    outcome_status="NO_BLOCK", market_context=context,
+                    portfolio_context=context["portfolio"], experiment_id=exp_id,
+                    llm_model=llm.model,
+                    **versions)
+                continue
         for block in blocks:
             sym = str(block.get("symbol", "")).upper()
             if sym not in SYMBOLS:
@@ -307,6 +381,29 @@ async def main() -> None:
             action = str(block.get("action") or "WAIT").upper()
             conf = float(block.get("confidence") or 0)
             price = px.get(sym) or summaries[sym]["price"]
+            if prefix:
+                # mirror the recorded outcome instead of re-validating, so the
+                # rebuild matches the original run even if config has drifted
+                rec = recorded_by_ts_sym.get((float(ts), sym)) or {}
+                eid = rec.get("execution_id") or ""
+                if rec.get("outcome_status") == "EXECUTED":
+                    if eid.startswith("bt-grid-") and sym not in grids:
+                        grids[sym] = SimGrid(
+                            GridSim(price * (1 - GRID_RANGE_PCT),
+                                    price * (1 + GRID_RANGE_PCT),
+                                    GRID_SIZE, tp=GRID_TP),
+                            sym, ts, eid, rec.get("market_regime"))
+                        cash -= GRID_SIZE
+                        trade_count += 1
+                    elif eid.startswith("bt-pos-") \
+                            and not any(p.symbol == sym for p in positions):
+                        positions.append(SimPosition(
+                            sym, action, price, POSITION_SIZE / price,
+                            ts + POS_TIME_LIMIT_S, ts, eid,
+                            rec.get("market_regime")))
+                        cash -= POSITION_SIZE
+                        trade_count += 1
+                continue
             execution_id = None
             risk_status = "PASSED"
             rejection_reason = None
@@ -395,9 +492,13 @@ async def main() -> None:
                 rejection_reason=rejection_reason,
                 llm_model=llm.model,
                 **versions)
-        print(f"  [{time.strftime('%m-%d %H:%M', time.gmtime(ts))}] "
-              + " ".join(f"{b.get('symbol')}:{b.get('action')}/{b.get('regime')}"
-                         for b in blocks))
+        if not prefix:
+            print(f"  [{time.strftime('%m-%d %H:%M', time.gmtime(ts))}] "
+                  + " ".join(f"{b.get('symbol')}:{b.get('action')}/{b.get('regime')}"
+                             for b in blocks))
+        elif i % 480 == 0:
+            print(f"  [rebuild {time.strftime('%m-%d %H:%M', time.gmtime(ts))}] "
+                  f"equity {equity:.2f}")
 
     # settle everything at the last price
     last_ts = timeline[-1]
@@ -480,7 +581,7 @@ async def main() -> None:
             "buy_hold_pnl": round(GRID_SIZE * (last / first - 1), 4),
         }
 
-    store.set_experiment_summary(exp_id, {
+    summary = {
         "replayed_window": {"start_ts": start_ts, "end_ts": end_ts},
         "start_equity": equity_curve[0]["equity"],
         "final_equity": equity_curve[-1]["equity"],
@@ -489,12 +590,17 @@ async def main() -> None:
         "baselines": baselines,
         "baseline_notional": {"fixed_grid": GRID_SIZE, "trend": POSITION_SIZE,
                               "buy_hold": GRID_SIZE},
-    })
+    }
+    if args.resume_exp:
+        summary["resumed"] = True
+        summary["resume_from_ts"] = resume_last_ts
+    store.set_experiment_summary(exp_id, summary)
     store.end_experiment(exp_id)
     store.close()
 
+    span_days = round((end_ts - start_ts) / 86400, 1)
     print("\n===== REPLAY RESULT =====")
-    print(f"experiment: {exp_id} ({args.days}d, decisions every {args.decision_hours}h)")
+    print(f"experiment: {exp_id} ({span_days}d, decisions every {args.decision_hours}h)")
     print(f"agent:  final equity ${equity_curve[-1]['equity']:.2f}"
           f" (start $10,000) · return {agent_eq['total_return'] and round(agent_eq['total_return']*100, 2)}%"
           f" · maxDD {agent_eq['max_drawdown_pct'] and round(agent_eq['max_drawdown_pct'], 2)}%"
