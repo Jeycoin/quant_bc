@@ -16,10 +16,12 @@ Simplifications (all documented in the report):
 - deterministic execution policy: grid when strategy=grid in RANGING,
   directional position when action=LONG/SHORT with confidence >= threshold
 - directional barriers are ATR-scaled by default (SL = 4x ATR14%, clamped to
-  [sl_pct, 3x sl_pct]; TP = 2.5x SL) with a breakeven stop that moves to
-  entry after +1x SL favorable excursion — the bt-replay-7d-aggressive
-  lesson was that fixed 1% stops inside multi-hour noise produce a
-  structural 10:4 stop:take-profit ratio
+  [sl_pct, 3x sl_pct]; TP = min(2.5x SL, 0.9x horizon sigma)) with a
+  breakeven stop that moves to entry after +1x SL favorable excursion —
+  the bt-replay-7d-aggressive lesson was that fixed 1% stops inside
+  multi-hour noise produce a structural 10:4 stop:take-profit ratio, and
+  the exp-5a5bc85adf5b lesson was that a TP beyond the holding horizon's
+  1-sigma move never triggers
 
 Usage:
   python scripts/backtest_agent.py [--days 7] [--bar-minutes 30]
@@ -31,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import time
@@ -192,17 +195,33 @@ def _resample(candles: list[dict], factor: int) -> list[dict]:
     return out
 
 
-def position_barriers(atr_pct: float | None, args) -> tuple[float, float]:
+def position_barriers(atr_pct: float | None, args,
+                      bar_seconds: int = 1800,
+                      horizon_s: float = POS_TIME_LIMIT_S) -> tuple[float, float]:
     """ATR-scaled (tp_pct, sl_pct) for directional positions.
 
     Lesson from bt-replay-7d-aggressive (exp-66c504e488ed): a fixed 1% SL
     against multi-hour holding periods sits inside the noise band — 10 stops
-    vs 4 take-profits. Stops must scale with volatility: SL = clamp(
-    sl_atr_mult x ATR14%%, sl_pct floor, 3x sl_pct cap), TP = rr x SL.
+    vs 4 take-profits. Lesson from exp-5a5bc85adf5b: TP = 2.5x SL can exceed
+    the whole holding horizon's 1-sigma move and never triggers (0 TP exits,
+    winners capped by TIME_LIMIT while losers pay full SL). So both barriers
+    must be consistent with the holding horizon:
+
+      SL = clamp(sl_atr_mult x ATR14%%, sl_pct floor, 3x sl_pct cap)
+      TP = min(rr x SL, 0.9 x sigma_horizon), at least 1.2x SL
+
+    where sigma_horizon = ATR%% x sqrt(horizon_bars), capped at 48 bars
+    (price series are closer to trending than pure random walk, so the cap
+    keeps the estimate conservative).
     """
     if args.sl_atr_mult > 0 and atr_pct:
-        sl = min(max(args.sl_atr_mult * atr_pct / 100.0, args.sl_pct), 3 * args.sl_pct)
-        return args.rr * sl, sl
+        atr = atr_pct / 100.0
+        sl = min(max(args.sl_atr_mult * atr, args.sl_pct), 3 * args.sl_pct)
+        horizon_bars = max(1.0, min(horizon_s / bar_seconds, 48))
+        sigma_h = atr * math.sqrt(horizon_bars)
+        tp = min(args.rr * sl, 0.9 * sigma_h)
+        tp = max(tp, 1.2 * sl)
+        return tp, sl
     return args.tp_pct, args.sl_pct
 
 
@@ -503,7 +522,8 @@ async def main() -> None:
                     elif eid.startswith("bt-pos-") \
                             and not any(p.symbol == sym for p in positions):
                         tp_eff, sl_eff = position_barriers(
-                            summaries[sym].get("atr_14bar_pct"), args)
+                            summaries[sym].get("atr_14bar_pct"), args,
+                            bar_seconds=args.bar_minutes * 60)
                         positions.append(SimPosition(
                             sym, action, price, notional / price,
                             ts + POS_TIME_LIMIT_S, ts, eid,
@@ -574,7 +594,8 @@ async def main() -> None:
             if action in ("LONG", "SHORT") and conf >= args.min_confidence \
                     and not any(p.symbol == sym for p in positions) and cash >= margin:
                 tp_eff, sl_eff = position_barriers(
-                    summaries[sym].get("atr_14bar_pct"), args)
+                    summaries[sym].get("atr_14bar_pct"), args,
+                    bar_seconds=args.bar_minutes * 60)
                 cost = cost_validator.validate_position(notional, tp_eff)
                 if not cost.approved:
                     risk_status, rejection_reason = "COST_REJECTED", cost.summary()
@@ -691,7 +712,8 @@ async def main() -> None:
                            abs(float(bars_so_far[j]["low"]) - closes_so_far[j - 1]))
                        for j in range(max(1, len(bars_so_far) - 14), len(bars_so_far))]
                 atr_pct = (sum(trs) / len(trs)) / px_now * 100 if trs else None
-                tp_b, sl_b = position_barriers(atr_pct, args)
+                tp_b, sl_b = position_barriers(atr_pct, args,
+                                               bar_seconds=args.bar_minutes * 60)
                 trend_pos = SimPosition(
                     sym, "LONG", px_now, notional / px_now,
                     c["timestamp"] + POS_TIME_LIMIT_S, c["timestamp"],

@@ -1,4 +1,5 @@
 """Tests for ATR-scaled barriers and the breakeven stop in backtest_agent."""
+import math
 import sys
 from pathlib import Path
 
@@ -23,17 +24,28 @@ def _pos(**kw) -> SimPosition:
 
 
 def test_barriers_scale_with_atr():
-    # ATR 0.5% -> SL = 4x0.5% = 2%, TP = 2.5x2% = 5%
+    # ATR 0.5% -> SL = 4x0.5% = 2%; horizon sigma = 0.5%*sqrt(48) = 3.46%
+    # -> TP = min(2.5x2%, 0.9x3.46%) = 3.12% (horizon cap binds)
     tp, sl = position_barriers(0.5, _Args)
-    assert abs(sl - 0.02) < 1e-9 and abs(tp - 0.05) < 1e-9
+    assert abs(sl - 0.02) < 1e-9
+    assert abs(tp - 0.9 * 0.005 * math.sqrt(48)) < 1e-9
 
 
 def test_barriers_floor_and_cap():
-    # tiny ATR -> floor at sl_pct; huge ATR -> cap at 3x sl_pct
+    # tiny ATR -> SL floor at sl_pct; TP floor keeps rr >= 1.2
     tp, sl = position_barriers(0.1, _Args)
-    assert sl == _Args.sl_pct and abs(tp - _Args.rr * _Args.sl_pct) < 1e-9
+    assert sl == _Args.sl_pct and abs(tp - 1.2 * _Args.sl_pct) < 1e-9
+    # huge ATR -> SL cap at 3x sl_pct, TP = rr x SL (horizon cap far away)
     tp, sl = position_barriers(5.0, _Args)
-    assert sl == 3 * _Args.sl_pct
+    assert sl == 3 * _Args.sl_pct and abs(tp - _Args.rr * 3 * _Args.sl_pct) < 1e-9
+
+
+def test_tp_never_exceeds_horizon_sigma():
+    # whatever the rr, TP stays within 0.9x the holding horizon's 1-sigma
+    for atr in (0.2, 0.35, 0.5, 0.8, 1.2):
+        tp, sl = position_barriers(atr, _Args)
+        assert tp <= 0.9 * atr / 100 * math.sqrt(48) + 1e-12 or tp == 1.2 * sl
+        assert tp >= 1.2 * sl - 1e-12
 
 
 def test_barriers_disabled_without_atr():
