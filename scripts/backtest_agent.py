@@ -80,8 +80,13 @@ returns, range positions, realized volatility, volume z-score, EMA cross,
 RSI and ATR (1 bar = bar_minutes, so 8 bars = 4h at 30m bars); the 48-bar
 (24h) fields and funding_rate are slow background context. Simulated
 execution policy: strategy "grid" in a ranging regime opens a grid;
-LONG/SHORT with confidence >= 0.6 opens a directional position; WAIT/WATCH
-does nothing. End your reply with one ```analysis block per symbol.
+LONG/SHORT at or above the configured confidence threshold opens a
+LEVERAGED directional position (liquidation is simulated — high leverage
+can wipe out the margin on a modest adverse move); WAIT/WATCH does
+nothing. This replay runs an aggressive risk profile: act decisively on
+high-conviction opportunities, but keep your confidence score honest —
+inflated confidence degrades the experiment. End your reply with one
+```analysis block per symbol.
 """
 
 
@@ -95,16 +100,31 @@ class SimPosition:
     opened_ts: float
     executor_id: str
     regime_at_entry: str | None
+    margin: float = POSITION_SIZE       # quote currency posted as margin
+    leverage: float = 1.0
+    tp_pct: float = POS_TP_PCT
+    sl_pct: float = POS_SL_PCT
 
     def check_exit(self, c: dict, ts: float) -> tuple[float, str, float] | None:
-        """Returns (net_pnl, reason, total_fees) or None."""
+        """Returns (net_pnl, reason, total_fees) or None.
+
+        Includes liquidation: with leverage L the position is wiped out when
+        price moves ~1/L against it (isolated-margin approximation — the
+        exchange's maintenance margin would liquidate slightly earlier).
+        """
         high, low, close = float(c["high"]), float(c["low"]), float(c["close"])
-        tp = self.entry * (1 + POS_TP_PCT) if self.side == "LONG" else self.entry * (1 - POS_TP_PCT)
-        sl = self.entry * (1 - POS_SL_PCT) if self.side == "LONG" else self.entry * (1 + POS_SL_PCT)
+        tp = self.entry * (1 + self.tp_pct) if self.side == "LONG" else self.entry * (1 - self.tp_pct)
+        sl = self.entry * (1 - self.sl_pct) if self.side == "LONG" else self.entry * (1 + self.sl_pct)
+        liq = self.entry * (1 - 1 / self.leverage) if self.side == "LONG" \
+            else self.entry * (1 + 1 / self.leverage)
         sign = 1 if self.side == "LONG" else -1
         exit_price = None
         reason = ""
-        if self.side == "LONG" and low <= sl:
+        if self.side == "LONG" and low <= liq and liq > sl:
+            exit_price, reason = liq, "LIQUIDATION"
+        elif self.side == "SHORT" and high >= liq and liq < sl:
+            exit_price, reason = liq, "LIQUIDATION"
+        elif self.side == "LONG" and low <= sl:
             exit_price, reason = sl, "STOP_LOSS"
         elif self.side == "SHORT" and high >= sl:
             exit_price, reason = sl, "STOP_LOSS"
@@ -172,6 +192,19 @@ async def main() -> None:
                         help="resume an interrupted replay experiment: rebuild "
                              "portfolio state from its recorded decisions without "
                              "LLM calls, then continue live decisions up to now")
+    # risk-appetite knobs (replay only; live limits live in config/settings.yaml)
+    parser.add_argument("--leverage", type=float, default=1.0,
+                        help="position leverage; qty = margin * leverage / price")
+    parser.add_argument("--position-margin", type=float, default=POSITION_SIZE,
+                        help="margin (quote) posted per directional position")
+    parser.add_argument("--tp-pct", type=float, default=POS_TP_PCT)
+    parser.add_argument("--sl-pct", type=float, default=POS_SL_PCT)
+    parser.add_argument("--min-confidence", type=float, default=MIN_CONFIDENCE)
+    parser.add_argument("--grid-size", type=float, default=GRID_SIZE)
+    parser.add_argument("--max-total-exposure", type=float, default=None,
+                        help="override risk.max_total_exposure_quote for this run")
+    parser.add_argument("--max-symbol-exposure", type=float, default=None,
+                        help="override risk.max_symbol_exposure_quote for this run")
     args = parser.parse_args()
 
     if sys.platform == "win32":
@@ -239,19 +272,29 @@ async def main() -> None:
     import yaml
     with open(REPO_ROOT / "config" / "settings.yaml", "r", encoding="utf-8") as fh:
         settings = yaml.safe_load(fh)
+    if args.max_total_exposure is not None:
+        settings.setdefault("risk", {})["max_total_exposure_quote"] = args.max_total_exposure
+    if args.max_symbol_exposure is not None:
+        settings.setdefault("risk", {})["max_symbol_exposure_quote"] = args.max_symbol_exposure
     cost_validator = CostValidator.from_config(settings)
     risk_validator = RiskValidator.from_config(settings)
+    margin = args.position_margin
+    leverage = args.leverage
+    notional = margin * leverage
+    risk_note = (f"lev={leverage:g}x margin={margin:g} notional={notional:g} "
+                 f"tp={args.tp_pct:g} sl={args.sl_pct:g} min_conf={args.min_confidence:g}")
     if exp_id is None:
         exp_id = store.start_experiment(
             name=f"bt-replay-{args.days}d",
             symbols=SYMBOLS,
             strategies=["grid", "position"],
-            notes=f"historical forward-replay backtest; indicative only; model={llm.model}",
+            notes=f"historical forward-replay backtest; indicative only; "
+                  f"model={llm.model}; {risk_note}",
             status="backtest",  # never 'running' — the live agent loop tags
                                 # decisions with the active 'running' experiment
             **versions,
         )
-    print(f"replay experiment: {exp_id}")
+    print(f"replay experiment: {exp_id} ({risk_note})")
 
     system = (REPO_ROOT / "agent" / "prompts" / "trading_manager.md") \
         .read_text(encoding="utf-8").replace("{{MODE}}", "PAPER") + REPLAY_ADDENDUM
@@ -281,7 +324,7 @@ async def main() -> None:
             result = pos.check_exit(c, ts)
             if result:
                 pnl, reason, fees = result
-                cash += POSITION_SIZE + pnl
+                cash += pos.margin + pnl
                 positions.remove(pos)
                 if not prefix:
                     store.upsert_trade_event(
@@ -301,7 +344,7 @@ async def main() -> None:
         px = {s: float((btc_by_ts if s == "BTC" else eth_by_ts).get(ts, {}).get("close", 0) or 0)
               for s in SYMBOLS}
         pos_val = sum(
-            POSITION_SIZE
+            p.margin
             + (px[p.symbol] - p.entry) * p.qty * (1 if p.side == "LONG" else -1)
             for p in positions if px.get(p.symbol))
         geq = sum(g.sim.equity(px[s]) for s, g in grids.items() if px.get(s))
@@ -405,17 +448,19 @@ async def main() -> None:
                         grids[sym] = SimGrid(
                             GridSim(price * (1 - GRID_RANGE_PCT),
                                     price * (1 + GRID_RANGE_PCT),
-                                    GRID_SIZE, tp=GRID_TP),
+                                    args.grid_size, tp=GRID_TP),
                             sym, ts, eid, rec.get("market_regime"))
-                        cash -= GRID_SIZE
+                        cash -= args.grid_size
                         trade_count += 1
                     elif eid.startswith("bt-pos-") \
                             and not any(p.symbol == sym for p in positions):
                         positions.append(SimPosition(
-                            sym, action, price, POSITION_SIZE / price,
+                            sym, action, price, notional / price,
                             ts + POS_TIME_LIMIT_S, ts, eid,
-                            rec.get("market_regime")))
-                        cash -= POSITION_SIZE
+                            rec.get("market_regime"),
+                            margin=margin, leverage=leverage,
+                            tp_pct=args.tp_pct, sl_pct=args.sl_pct))
+                        cash -= margin
                         trade_count += 1
                 continue
             execution_id = None
@@ -438,15 +483,15 @@ async def main() -> None:
                     rejection = ("GRID_REJECTED",
                                  f"{grid_state.state}: {'; '.join(grid_state.reasons)}")
                 else:
-                    cost = cost_validator.validate_grid(GRID_SIZE, GRID_TP,
+                    cost = cost_validator.validate_grid(args.grid_size, GRID_TP,
                                                         maker_entry=True, maker_exit=True)
                     if not cost.approved:
                         rejection = ("COST_REJECTED", cost.summary())
                 if rejection is None:
                     risk = risk_validator.validate(
-                        symbol=sym, new_exposure_quote=GRID_SIZE,
-                        current_exposure_quote=GRID_SIZE * len(grids)
-                        + POSITION_SIZE * len(positions),
+                        symbol=sym, new_exposure_quote=args.grid_size,
+                        current_exposure_quote=args.grid_size * len(grids)
+                        + notional * len(positions),
                         symbol_exposure_quote=0.0)
                     if not risk.approved:
                         rejection = ("RISK_REJECTED", "; ".join(risk.reasons))
@@ -456,9 +501,9 @@ async def main() -> None:
                     execution_id = f"bt-grid-{sym}-{int(ts)}"
                     grids[sym] = SimGrid(
                         GridSim(price * (1 - GRID_RANGE_PCT), price * (1 + GRID_RANGE_PCT),
-                                GRID_SIZE, tp=GRID_TP),
+                                args.grid_size, tp=GRID_TP),
                         sym, ts, execution_id, regime)
-                    cash -= GRID_SIZE
+                    cash -= args.grid_size
                     trade_count += 1
             elif (block.get("strategy") != "grid" and sym in grids) \
                     or (sym in grids and grid_state.state == GRID_EXIT):
@@ -467,7 +512,7 @@ async def main() -> None:
                     if sym in grids and grid_state.state == GRID_EXIT else "REGIME_EXIT"
                 g = grids.pop(sym)
                 cash += g.sim.equity(price)
-                closed_pnl = g.sim.equity(price) - GRID_SIZE
+                closed_pnl = g.sim.equity(price) - args.grid_size
                 store.upsert_trade_event(
                     executor_id=g.executor_id, ts_open=g.opened_ts, ts_close=ts,
                     symbol=sym, strategy="grid_executor", status="CLOSED",
@@ -475,26 +520,28 @@ async def main() -> None:
                     fees_quote=g.sim.fees, gross_pnl=closed_pnl + g.sim.fees,
                     regime_at_entry=g.regime_at_entry,
                     source="agent", experiment_id=exp_id)
-            if action in ("LONG", "SHORT") and conf >= MIN_CONFIDENCE \
-                    and not any(p.symbol == sym for p in positions) and cash >= POSITION_SIZE:
-                cost = cost_validator.validate_position(POSITION_SIZE, POS_TP_PCT)
+            if action in ("LONG", "SHORT") and conf >= args.min_confidence \
+                    and not any(p.symbol == sym for p in positions) and cash >= margin:
+                cost = cost_validator.validate_position(notional, args.tp_pct)
                 if not cost.approved:
                     risk_status, rejection_reason = "COST_REJECTED", cost.summary()
                 else:
                     risk = risk_validator.validate(
-                        symbol=sym, new_exposure_quote=POSITION_SIZE,
-                        current_exposure_quote=GRID_SIZE * len(grids)
-                        + POSITION_SIZE * len(positions),
-                        symbol_exposure_quote=POSITION_SIZE *
+                        symbol=sym, new_exposure_quote=notional,
+                        current_exposure_quote=args.grid_size * len(grids)
+                        + notional * len(positions),
+                        symbol_exposure_quote=notional *
                         sum(1 for p in positions if p.symbol == sym))
                     if not risk.approved:
                         risk_status, rejection_reason = "RISK_REJECTED", "; ".join(risk.reasons)
                     else:
                         execution_id = f"bt-pos-{sym}-{int(ts)}"
                         positions.append(SimPosition(
-                            sym, action, price, POSITION_SIZE / price,
-                            ts + POS_TIME_LIMIT_S, ts, execution_id, regime))
-                        cash -= POSITION_SIZE
+                            sym, action, price, notional / price,
+                            ts + POS_TIME_LIMIT_S, ts, execution_id, regime,
+                            margin=margin, leverage=leverage,
+                            tp_pct=args.tp_pct, sl_pct=args.sl_pct))
+                        cash -= margin
                         trade_count += 1
 
             store.record_decision_event(
@@ -524,7 +571,7 @@ async def main() -> None:
         sign = 1 if pos.side == "LONG" else -1
         fees = (pos.entry + price) * pos.qty * FEE_RATE
         pnl = (price - pos.entry) * pos.qty * sign - fees
-        cash += POSITION_SIZE + pnl
+        cash += pos.margin + pnl
         store.upsert_trade_event(
             executor_id=pos.executor_id, ts_open=pos.opened_ts, ts_close=last_ts,
             symbol=pos.symbol, strategy="position_executor", side=pos.side,
@@ -535,7 +582,7 @@ async def main() -> None:
     for sym, g in list(grids.items()):
         price = px[sym]
         cash += g.sim.equity(price)
-        grid_pnl = g.sim.equity(price) - GRID_SIZE
+        grid_pnl = g.sim.equity(price) - args.grid_size
         store.upsert_trade_event(
             executor_id=g.executor_id, ts_open=g.opened_ts, ts_close=last_ts,
             symbol=sym, strategy="grid_executor", status="CLOSED",
@@ -551,13 +598,13 @@ async def main() -> None:
     for sym in SYMBOLS:
         window = [c for c in candles[sym] if start_ts <= c["timestamp"] <= end_ts]
         first, last = float(window[0]["close"]), float(window[-1]["close"])
-        base = GridSim(first * 0.97, first * 1.03, GRID_SIZE, tp=GRID_TP)
+        base = GridSim(first * 0.97, first * 1.03, args.grid_size, tp=GRID_TP)
         for c in window:
             base.process_candle(c)
         store.upsert_trade_event(
             executor_id=f"bt-baseline-grid-{sym}", ts_open=start_ts, ts_close=last_ts,
             symbol=sym, strategy="grid_executor", status="CLOSED",
-            close_type="REPLAY_END", pnl_quote=base.equity(last) - GRID_SIZE,
+            close_type="REPLAY_END", pnl_quote=base.equity(last) - args.grid_size,
             fees_quote=base.fees, source="baseline", experiment_id=exp_id)
 
         # fixed trend baseline: EMA20/EMA50 cross, same barriers as agent positions
@@ -583,9 +630,11 @@ async def main() -> None:
                     _ema(closes_so_far[-80 * bph:], 50 * bph):
                 px_now = float(c["close"])
                 trend_pos = SimPosition(
-                    sym, "LONG", px_now, POSITION_SIZE / px_now,
+                    sym, "LONG", px_now, notional / px_now,
                     c["timestamp"] + POS_TIME_LIMIT_S, c["timestamp"],
-                    f"bt-baseline-trend-{sym}-{int(c['timestamp'])}", None)
+                    f"bt-baseline-trend-{sym}-{int(c['timestamp'])}", None,
+                    margin=margin, leverage=leverage,
+                    tp_pct=args.tp_pct, sl_pct=args.sl_pct)
         if trend_pos is not None:
             sign = 1
             fees = (trend_pos.entry + last) * trend_pos.qty * FEE_RATE
@@ -593,10 +642,10 @@ async def main() -> None:
             trend_trades += 1
 
         baselines[sym] = {
-            "fixed_grid_pnl": round(base.equity(last) - GRID_SIZE, 4),
+            "fixed_grid_pnl": round(base.equity(last) - args.grid_size, 4),
             "fixed_trend_pnl": round(trend_pnl, 4),
             "fixed_trend_trades": trend_trades,
-            "buy_hold_pnl": round(GRID_SIZE * (last / first - 1), 4),
+            "buy_hold_pnl": round(args.grid_size * (last / first - 1), 4),
         }
 
     summary = {
@@ -606,8 +655,15 @@ async def main() -> None:
         "agent_equity_metrics": agent_eq,
         "trade_count": trade_count,
         "baselines": baselines,
-        "baseline_notional": {"fixed_grid": GRID_SIZE, "trend": POSITION_SIZE,
-                              "buy_hold": GRID_SIZE},
+        "baseline_notional": {"fixed_grid": args.grid_size, "trend": notional,
+                              "buy_hold": args.grid_size},
+        "risk_profile": {"leverage": leverage, "position_margin": margin,
+                         "position_notional": notional, "tp_pct": args.tp_pct,
+                         "sl_pct": args.sl_pct,
+                         "min_confidence": args.min_confidence,
+                         "grid_size": args.grid_size,
+                         "bar_minutes": args.bar_minutes,
+                         "decision_minutes": args.decision_minutes},
     }
     if args.resume_exp:
         summary["resumed"] = True
@@ -627,7 +683,7 @@ async def main() -> None:
     for sym, b in baselines.items():
         print(f"baseline {sym}: fixed grid {b['fixed_grid_pnl']:+.2f}"
               f" · fixed trend {b['fixed_trend_pnl']:+.2f} ({b['fixed_trend_trades']} trades)"
-              f" · buy&hold {b['buy_hold_pnl']:+.2f} (on ${GRID_SIZE:.0f})")
+              f" · buy&hold {b['buy_hold_pnl']:+.2f} (on ${args.grid_size:.0f})")
     print("note: unknown model training cutoff — contamination cannot be ruled out;")
 
 

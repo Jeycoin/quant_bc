@@ -38,8 +38,10 @@ cost:
 # Portfolio-level risk limits (agent/validators.py RiskValidator), evaluated
 # from actual account state — not from the LLM's self-report.
 risk:
-  max_total_exposure_quote: 1500
-  max_symbol_exposure_quote: 600
+  # ELEVATED 2026-10-05 per user request (aggressive risk-appetite experiment,
+  # TESTNET only — restore to 1500/600 before any LIVE deployment)
+  max_total_exposure_quote: 8000
+  max_symbol_exposure_quote: 4000
   max_drawdown_pct: 10     # enforced when equity history is available
 
 # Grid protection state machine thresholds (agent/validators.py).
