@@ -14,7 +14,12 @@ Simplifications (all documented in the report):
 - no order book history (not available) — candles + funding only
 - flat 0.04% fee per side, candle-range fills, no slippage
 - deterministic execution policy: grid when strategy=grid in RANGING,
-  directional position when action=LONG/SHORT with confidence >= 0.6
+  directional position when action=LONG/SHORT with confidence >= threshold
+- directional barriers are ATR-scaled by default (SL = 4x ATR14%, clamped to
+  [sl_pct, 3x sl_pct]; TP = 2.5x SL) with a breakeven stop that moves to
+  entry after +1x SL favorable excursion — the bt-replay-7d-aggressive
+  lesson was that fixed 1% stops inside multi-hour noise produce a
+  structural 10:4 stop:take-profit ratio
 
 Usage:
   python scripts/backtest_agent.py [--days 7] [--bar-minutes 30]
@@ -81,9 +86,11 @@ RSI and ATR (1 bar = bar_minutes, so 8 bars = 4h at 30m bars); the 48-bar
 (24h) fields and funding_rate are slow background context. Simulated
 execution policy: strategy "grid" in a ranging regime opens a grid;
 LONG/SHORT at or above the configured confidence threshold opens a
-LEVERAGED directional position (liquidation is simulated — high leverage
-can wipe out the margin on a modest adverse move); WAIT/WATCH does
-nothing. This replay runs an aggressive risk profile: act decisively on
+LEVERAGED directional position with ATR-scaled TP/SL and a breakeven stop
+(liquidation is simulated — high leverage can wipe out the margin on a
+modest adverse move); WAIT/WATCH does nothing. LONG and SHORT are fully
+symmetric in this replay — same costs, same barriers, both always
+available. This replay runs an aggressive risk profile: act decisively on
 high-conviction opportunities, but keep your confidence score honest —
 inflated confidence degrades the experiment. End your reply with one
 ```analysis block per symbol.
@@ -104,6 +111,8 @@ class SimPosition:
     leverage: float = 1.0
     tp_pct: float = POS_TP_PCT
     sl_pct: float = POS_SL_PCT
+    breakeven: bool = False   # move SL to entry after +1x SL favorable excursion
+    be_active: bool = False
 
     def check_exit(self, c: dict, ts: float) -> tuple[float, str, float] | None:
         """Returns (net_pnl, reason, total_fees) or None.
@@ -111,10 +120,16 @@ class SimPosition:
         Includes liquidation: with leverage L the position is wiped out when
         price moves ~1/L against it (isolated-margin approximation — the
         exchange's maintenance margin would liquidate slightly earlier).
+        Breakeven: once price has moved +1x sl_pct in favor without touching
+        the original stop, the stop moves to entry (a scratch exit still
+        pays fees). Intra-candle ambiguity resolves conservatively: if a
+        single candle touches both the trigger and the original stop, the
+        stop is assumed hit first.
         """
         high, low, close = float(c["high"]), float(c["low"]), float(c["close"])
+        sl_pct_eff = 0.0 if self.be_active else self.sl_pct
         tp = self.entry * (1 + self.tp_pct) if self.side == "LONG" else self.entry * (1 - self.tp_pct)
-        sl = self.entry * (1 - self.sl_pct) if self.side == "LONG" else self.entry * (1 + self.sl_pct)
+        sl = self.entry * (1 - sl_pct_eff) if self.side == "LONG" else self.entry * (1 + sl_pct_eff)
         liq = self.entry * (1 - 1 / self.leverage) if self.side == "LONG" \
             else self.entry * (1 + 1 / self.leverage)
         sign = 1 if self.side == "LONG" else -1
@@ -125,15 +140,23 @@ class SimPosition:
         elif self.side == "SHORT" and high >= liq and liq < sl:
             exit_price, reason = liq, "LIQUIDATION"
         elif self.side == "LONG" and low <= sl:
-            exit_price, reason = sl, "STOP_LOSS"
+            exit_price, reason = sl, "BREAKEVEN_EXIT" if self.be_active else "STOP_LOSS"
         elif self.side == "SHORT" and high >= sl:
-            exit_price, reason = sl, "STOP_LOSS"
+            exit_price, reason = sl, "BREAKEVEN_EXIT" if self.be_active else "STOP_LOSS"
         elif self.side == "LONG" and high >= tp:
             exit_price, reason = tp, "TAKE_PROFIT"
         elif self.side == "SHORT" and low <= tp:
             exit_price, reason = tp, "TAKE_PROFIT"
         elif ts >= self.deadline:
             exit_price, reason = close, "TIME_LIMIT"
+        if exit_price is None and self.breakeven and not self.be_active:
+            trigger = self.entry * (1 + self.sl_pct) if self.side == "LONG" \
+                else self.entry * (1 - self.sl_pct)
+            orig_sl_hit = (low <= self.entry * (1 - self.sl_pct)) if self.side == "LONG" \
+                else (high >= self.entry * (1 + self.sl_pct))
+            trig_hit = (high >= trigger) if self.side == "LONG" else (low <= trigger)
+            if trig_hit and not orig_sl_hit:
+                self.be_active = True
         if exit_price is None:
             return None
         gross = (exit_price - self.entry) * self.qty * sign
@@ -169,6 +192,20 @@ def _resample(candles: list[dict], factor: int) -> list[dict]:
     return out
 
 
+def position_barriers(atr_pct: float | None, args) -> tuple[float, float]:
+    """ATR-scaled (tp_pct, sl_pct) for directional positions.
+
+    Lesson from bt-replay-7d-aggressive (exp-66c504e488ed): a fixed 1% SL
+    against multi-hour holding periods sits inside the noise band — 10 stops
+    vs 4 take-profits. Stops must scale with volatility: SL = clamp(
+    sl_atr_mult x ATR14%%, sl_pct floor, 3x sl_pct cap), TP = rr x SL.
+    """
+    if args.sl_atr_mult > 0 and atr_pct:
+        sl = min(max(args.sl_atr_mult * atr_pct / 100.0, args.sl_pct), 3 * args.sl_pct)
+        return args.rr * sl, sl
+    return args.tp_pct, args.sl_pct
+
+
 async def fetch_funding(coin: str, start_ms: int) -> dict[float, float]:
     # trust_env=False: see fetch_candles in backtest_grid.py
     async with httpx.AsyncClient(base_url="https://api.hyperliquid.xyz",
@@ -198,7 +235,16 @@ async def main() -> None:
     parser.add_argument("--position-margin", type=float, default=POSITION_SIZE,
                         help="margin (quote) posted per directional position")
     parser.add_argument("--tp-pct", type=float, default=POS_TP_PCT)
-    parser.add_argument("--sl-pct", type=float, default=POS_SL_PCT)
+    parser.add_argument("--sl-pct", type=float, default=POS_SL_PCT,
+                        help="also the floor for ATR-scaled stops")
+    parser.add_argument("--sl-atr-mult", type=float, default=4.0,
+                        help="SL = clamp(sl_atr_mult x ATR14%%, sl_pct, 3x sl_pct); "
+                             "0 disables ATR scaling (fixed --sl-pct/--tp-pct)")
+    parser.add_argument("--rr", type=float, default=2.5,
+                        help="reward:risk ratio; TP = rr x SL when ATR scaling active")
+    parser.add_argument("--no-breakeven", action="store_true",
+                        help="disable breakeven stop (default: SL moves to entry "
+                             "after +1x SL favorable excursion)")
     parser.add_argument("--min-confidence", type=float, default=MIN_CONFIDENCE)
     parser.add_argument("--grid-size", type=float, default=GRID_SIZE)
     parser.add_argument("--max-total-exposure", type=float, default=None,
@@ -282,7 +328,9 @@ async def main() -> None:
     leverage = args.leverage
     notional = margin * leverage
     risk_note = (f"lev={leverage:g}x margin={margin:g} notional={notional:g} "
-                 f"tp={args.tp_pct:g} sl={args.sl_pct:g} min_conf={args.min_confidence:g}")
+                 f"tp={args.tp_pct:g} sl={args.sl_pct:g} sl_atr_mult={args.sl_atr_mult:g} "
+                 f"rr={args.rr:g} breakeven={not args.no_breakeven} "
+                 f"min_conf={args.min_confidence:g}")
     if exp_id is None:
         exp_id = store.start_experiment(
             name=f"bt-replay-{args.days}d",
@@ -454,12 +502,15 @@ async def main() -> None:
                         trade_count += 1
                     elif eid.startswith("bt-pos-") \
                             and not any(p.symbol == sym for p in positions):
+                        tp_eff, sl_eff = position_barriers(
+                            summaries[sym].get("atr_14bar_pct"), args)
                         positions.append(SimPosition(
                             sym, action, price, notional / price,
                             ts + POS_TIME_LIMIT_S, ts, eid,
                             rec.get("market_regime"),
                             margin=margin, leverage=leverage,
-                            tp_pct=args.tp_pct, sl_pct=args.sl_pct))
+                            tp_pct=tp_eff, sl_pct=sl_eff,
+                            breakeven=not args.no_breakeven))
                         cash -= margin
                         trade_count += 1
                 continue
@@ -522,7 +573,9 @@ async def main() -> None:
                     source="agent", experiment_id=exp_id)
             if action in ("LONG", "SHORT") and conf >= args.min_confidence \
                     and not any(p.symbol == sym for p in positions) and cash >= margin:
-                cost = cost_validator.validate_position(notional, args.tp_pct)
+                tp_eff, sl_eff = position_barriers(
+                    summaries[sym].get("atr_14bar_pct"), args)
+                cost = cost_validator.validate_position(notional, tp_eff)
                 if not cost.approved:
                     risk_status, rejection_reason = "COST_REJECTED", cost.summary()
                 else:
@@ -540,7 +593,8 @@ async def main() -> None:
                             sym, action, price, notional / price,
                             ts + POS_TIME_LIMIT_S, ts, execution_id, regime,
                             margin=margin, leverage=leverage,
-                            tp_pct=args.tp_pct, sl_pct=args.sl_pct))
+                            tp_pct=tp_eff, sl_pct=sl_eff,
+                            breakeven=not args.no_breakeven))
                         cash -= margin
                         trade_count += 1
 
@@ -616,8 +670,10 @@ async def main() -> None:
             return e
         trend_pnl, trend_trades, trend_pos = 0.0, 0, None
         closes_so_far: list[float] = []
+        bars_so_far: list[dict] = []
         for c in window:
             closes_so_far.append(float(c["close"]))
+            bars_so_far.append(c)
             if trend_pos is not None:
                 result = trend_pos.check_exit(c, c["timestamp"])
                 if result:
@@ -629,12 +685,20 @@ async def main() -> None:
                     _ema(closes_so_far[-40 * bph:], 20 * bph) > \
                     _ema(closes_so_far[-80 * bph:], 50 * bph):
                 px_now = float(c["close"])
+                # same ATR-scaled barrier policy as agent positions
+                trs = [max(float(bars_so_far[j]["high"]) - float(bars_so_far[j]["low"]),
+                           abs(float(bars_so_far[j]["high"]) - closes_so_far[j - 1]),
+                           abs(float(bars_so_far[j]["low"]) - closes_so_far[j - 1]))
+                       for j in range(max(1, len(bars_so_far) - 14), len(bars_so_far))]
+                atr_pct = (sum(trs) / len(trs)) / px_now * 100 if trs else None
+                tp_b, sl_b = position_barriers(atr_pct, args)
                 trend_pos = SimPosition(
                     sym, "LONG", px_now, notional / px_now,
                     c["timestamp"] + POS_TIME_LIMIT_S, c["timestamp"],
                     f"bt-baseline-trend-{sym}-{int(c['timestamp'])}", None,
                     margin=margin, leverage=leverage,
-                    tp_pct=args.tp_pct, sl_pct=args.sl_pct)
+                    tp_pct=tp_b, sl_pct=sl_b,
+                    breakeven=not args.no_breakeven)
         if trend_pos is not None:
             sign = 1
             fees = (trend_pos.entry + last) * trend_pos.qty * FEE_RATE
@@ -660,6 +724,8 @@ async def main() -> None:
         "risk_profile": {"leverage": leverage, "position_margin": margin,
                          "position_notional": notional, "tp_pct": args.tp_pct,
                          "sl_pct": args.sl_pct,
+                         "sl_atr_mult": args.sl_atr_mult, "rr": args.rr,
+                         "breakeven": not args.no_breakeven,
                          "min_confidence": args.min_confidence,
                          "grid_size": args.grid_size,
                          "bar_minutes": args.bar_minutes,

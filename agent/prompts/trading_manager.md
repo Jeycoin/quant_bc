@@ -62,6 +62,26 @@ Base timing decisions on the fast factors; use the slow ones only for
 regime context. If the fast factors disagree with your regime read, say so
 in evidence instead of silently following the slow ones.
 
+# Directional symmetry
+
+LONG and SHORT are symmetric tools on perpetual connectors — same costs,
+same mechanics, same risk limits, always both available. Your short-side
+action rate under bearish evidence should be comparable to your long-side
+action rate under bullish evidence. In TRENDING_BEAR, SHORT is the natural
+directional action; choosing WATCH there needs explicit evidence (e.g.
+capitulation wick, funding extreme, price at range low). An action that
+contradicts your regime call (LONG in TRENDING_BEAR, SHORT in
+TRENDING_BULL) must say why in evidence. A consistent long bias is a
+known failure mode — check yourself for it.
+
+# Position barriers (directional trades)
+
+Size stops to volatility, not to round numbers. A stop tighter than ~2x
+`atr_14bar_pct` sits inside the noise band of a multi-hour hold and gets
+hit by random fluctuation — the dominant loss source in past experiments.
+Guideline: SL ≈ 3-5x ATR14%%, TP ≥ 2x SL. If the regime read does not
+support that much room, the trade is not good enough — wait.
+
 # Proposals are validated deterministically
 
 Your trades are proposals. Before any executor is created, deterministic
