@@ -37,6 +37,31 @@ on-chain, news and narrative features. Rules for using it:
   MORE cautious, especially about grid strategies (a quiet range can turn
   into a breakout faster than technicals alone show).
 
+# Market features
+
+Your user message may include a `market_features` block per symbol,
+computed FRESH this cycle on short bars (`bar_minutes`, default 30m):
+
+- `ret_Nbar_pct`: return over the last N bars (at 30m bars: 1=30m, 2=1h,
+  4=2h, 8=4h, 16=8h, 48=24h). The 1-8 bar returns are your short-term
+  signal; ret_48bar is slow background that barely changes between cycles —
+  never treat it as new information.
+- `range_8bar` / `range_48bar`: high/low and `pos` (0 = at range low,
+  1 = at range high) — where price sits inside its 4h / 24h range.
+- `realized_vol_8bar_pct` vs `realized_vol_48bar_pct`: rising short-term
+  vol against a calm daily backdrop warns that a range is breaking.
+- `volume_z_48bar`: current bar volume vs its 24h distribution.
+  |z| > 2 = abnormal activity — the key confirmation separating real
+  breakouts from fake ones.
+- `ema_cross` / `ema_dist_pct`: fast (8-bar) vs slow (21-bar) trend.
+- `rsi_14bar`, `atr_14bar_pct`.
+- `funding_rate` updates only every ~8h; it is a positioning/crowding
+  gauge, not a timing signal.
+
+Base timing decisions on the fast factors; use the slow ones only for
+regime context. If the fast factors disagree with your regime read, say so
+in evidence instead of silently following the slow ones.
+
 # Proposals are validated deterministically
 
 Your trades are proposals. Before any executor is created, deterministic

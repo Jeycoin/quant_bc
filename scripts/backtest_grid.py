@@ -30,8 +30,8 @@ load_dotenv(REPO_ROOT / ".env")
 FEE_RATE = 0.0004  # perp taker-ish; conservative flat fee per fill
 
 
-async def fetch_candles(coin: str, days: int) -> list[dict]:
-    """Page 1h candles directly from the Hyperliquid public API.
+async def fetch_candles(coin: str, days: int, interval: str = "1h") -> list[dict]:
+    """Page candles directly from the Hyperliquid public API.
 
     The Hummingbot REST candles endpoint has no time-range params (only
     max_records), so history paging goes to the exchange's own API — the
@@ -53,7 +53,7 @@ async def fetch_candles(coin: str, days: int) -> list[dict]:
         while cursor < end_ms:
             resp = await client.post("/info", json={
                 "type": "candleSnapshot",
-                "req": {"coin": coin, "interval": "1h",
+                "req": {"coin": coin, "interval": interval,
                         "startTime": cursor, "endTime": end_ms},
             })
             resp.raise_for_status()

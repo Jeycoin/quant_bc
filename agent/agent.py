@@ -191,6 +191,12 @@ class TradingAgent:
         self._created_executors = []
         self._blocked = False
         self._market_snapshot = {}
+        market_feats = await self._market_features_context()
+        if market_feats:
+            user_message += (
+                "\n\n[market_features] fresh multi-horizon features per symbol "
+                "(short bars; see the Market features section of your prompt)\n"
+                + json.dumps(market_feats, ensure_ascii=False))
         self._intel_snapshot = await self._intel_context()
         if self._intel_snapshot:
             user_message = (
@@ -680,6 +686,79 @@ class TradingAgent:
             return snapshot.for_llm()
         except Exception:
             return None
+
+    async def _market_features_context(self) -> dict[str, Any] | None:
+        """Fresh multi-horizon market features per symbol (short bars).
+
+        Uses the same feature function as the historical replay so live
+        decisions and backtests see identical inputs. Best-effort: returns
+        None on any failure — the agent then relies on its MCP tools only.
+        """
+        try:
+            from agent.market_features import MIN_BARS, compute_market_features
+
+            symbols = self.guard.config["safety"].get("allowed_base_assets",
+                                                      ["BTC", "ETH"])
+            symbols = [s for s in symbols if not s.startswith("U")]
+            bar = os.getenv("FEATURE_BAR", "30m")
+            out: dict[str, Any] = {}
+            for sym in symbols:
+                data = await self._hb_rest("POST", "/market-data/candles", {
+                    "connector_name": os.getenv("MARKET_PROBE_CONNECTOR",
+                                                "hyperliquid_perpetual"),
+                    "trading_pair": f"{sym}-USD",
+                    "interval": bar, "max_records": 120,
+                })
+                rows = data.get("candles", data) if isinstance(data, dict) else data
+                candles = []
+                for c in rows or []:
+                    try:
+                        ts = float(c["timestamp"])
+                        candles.append({
+                            "timestamp": ts / 1000 if ts > 1e12 else ts,
+                            "open": float(c["open"]), "high": float(c["high"]),
+                            "low": float(c["low"]), "close": float(c["close"]),
+                            "volume": float(c.get("volume", 0) or 0),
+                        })
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                candles.sort(key=lambda c: c["timestamp"])
+                if len(candles) < MIN_BARS:
+                    # the Hummingbot candles endpoint only serves what the
+                    # connector has collected live — fall back to the public
+                    # API (read-only market data, same venue) for full depth
+                    candles = await self._public_candles(sym, bar)
+                feats = compute_market_features(candles)
+                if feats:
+                    out[sym] = feats
+            return out or None
+        except Exception:
+            return None
+
+    async def _public_candles(self, coin: str, interval: str,
+                              hours: int = 48) -> list[dict]:
+        import time as _time
+
+        import httpx
+
+        end_ms = int(_time.time() * 1000)
+        start_ms = end_ms - hours * 3600_000
+        # trust_env=False: the Windows system proxy must not silently route
+        # market-data fetches; set MARKET_DATA_PROXY in .env if needed
+        async with httpx.AsyncClient(
+            base_url="https://api.hyperliquid.xyz", timeout=30.0,
+            trust_env=False, proxy=os.environ.get("MARKET_DATA_PROXY") or None,
+        ) as client:
+            resp = await client.post("/info", json={
+                "type": "candleSnapshot",
+                "req": {"coin": coin, "interval": interval,
+                        "startTime": start_ms, "endTime": end_ms}})
+            resp.raise_for_status()
+            batch = resp.json()
+        return [{"timestamp": c["t"] / 1000, "open": float(c["o"]),
+                 "high": float(c["h"]), "low": float(c["l"]),
+                 "close": float(c["c"]), "volume": float(c["v"])}
+                for c in batch]
 
     async def _hb_rest(self, method: str, path: str, payload: dict[str, Any]) -> Any:
         import httpx

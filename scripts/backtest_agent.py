@@ -17,7 +17,8 @@ Simplifications (all documented in the report):
   directional position when action=LONG/SHORT with confidence >= 0.6
 
 Usage:
-  python scripts/backtest_agent.py [--days 7] [--decision-hours 2]
+  python scripts/backtest_agent.py [--days 7] [--bar-minutes 30]
+      [--decision-minutes 30] [--resume-exp EXP_ID]
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 load_dotenv(REPO_ROOT / ".env")
 
 from agent.agent import extract_analysis_blocks, normalize_regime
+from agent.market_features import compute_market_features
 from agent.validators import (
     GRID_DEFENSIVE,
     GRID_EXIT,
@@ -72,10 +74,14 @@ REPLAY_ADDENDUM = """
 You are in a historical market replay. Current time is given in the user
 message. All market data is provided inline — no tools are available, do
 not attempt tool calls. Use ONLY the provided data; do not use any outside
-knowledge of what happened after the stated time. Simulated execution
-policy: strategy "grid" in a ranging regime opens a grid; LONG/SHORT with
-confidence >= 0.6 opens a directional position; WAIT/WATCH does nothing.
-End your reply with one ```analysis block per symbol.
+knowledge of what happened after the stated time. The `markets` block
+contains multi-horizon features computed on fresh short-term bars: ret_Nbar
+returns, range positions, realized volatility, volume z-score, EMA cross,
+RSI and ATR (1 bar = bar_minutes, so 8 bars = 4h at 30m bars); the 48-bar
+(24h) fields and funding_rate are slow background context. Simulated
+execution policy: strategy "grid" in a ranging regime opens a grid;
+LONG/SHORT with confidence >= 0.6 opens a directional position; WAIT/WATCH
+does nothing. End your reply with one ```analysis block per symbol.
 """
 
 
@@ -124,26 +130,23 @@ class SimGrid:
     regime_at_entry: str | None
 
 
-def _summarize(candles: list[dict], upto_ts: float) -> dict | None:
-    past = [c for c in candles if c["timestamp"] <= upto_ts]
-    if len(past) < 48:
-        return None
-    closes = [float(c["close"]) for c in past]
-    last24 = past[-24:]
-    last48 = past[-48:]
-    rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-48, 0)]
-    vol = (sum((r - sum(rets) / len(rets)) ** 2 for r in rets) / len(rets)) ** 0.5
-    return {
-        "price": closes[-1],
-        "24h_change_pct": round((closes[-1] / closes[-25] - 1) * 100, 2),
-        "24h_high": max(float(c["high"]) for c in last24),
-        "24h_low": min(float(c["low"]) for c in last24),
-        "48h_high": max(float(c["high"]) for c in last48),
-        "48h_low": min(float(c["low"]) for c in last48),
-        "hourly_vol_pct": round(vol * 100, 3),
-        "24h_volume": round(sum(float(c["volume"]) for c in last24), 1),
-        "last_12_closes": [round(x, 2) for x in closes[-12:]],
-    }
+def _resample(candles: list[dict], factor: int) -> list[dict]:
+    """Aggregate `factor` consecutive bars into one. Used to keep the grid
+    protection state machine on its original 1h semantics while the LLM
+    features run on shorter bars."""
+    if factor <= 1:
+        return candles
+    out = []
+    for i in range(0, len(candles) - factor + 1, factor):
+        grp = candles[i:i + factor]
+        out.append({
+            "timestamp": grp[0]["timestamp"], "open": grp[0]["open"],
+            "high": max(g["high"] for g in grp),
+            "low": min(g["low"] for g in grp),
+            "close": grp[-1]["close"],
+            "volume": sum(g["volume"] for g in grp),
+        })
+    return out
 
 
 async def fetch_funding(coin: str, start_ms: int) -> dict[float, float]:
@@ -161,7 +164,10 @@ async def fetch_funding(coin: str, start_ms: int) -> dict[float, float]:
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Agent replay backtest")
     parser.add_argument("--days", type=int, default=7)
-    parser.add_argument("--decision-hours", type=int, default=2)
+    parser.add_argument("--bar-minutes", type=int, default=30,
+                        help="candle bar size; LLM features are computed on these bars")
+    parser.add_argument("--decision-minutes", type=int, default=30,
+                        help="decision cadence; should match the live loop interval")
     parser.add_argument("--resume-exp", default=None,
                         help="resume an interrupted replay experiment: rebuild "
                              "portfolio state from its recorded decisions without "
@@ -221,8 +227,9 @@ async def main() -> None:
           f" -> {time.strftime('%m-%d %H:%M', time.localtime(end_ts))} ...")
     candles = {}
     funding = {}
+    bar_interval = f"{args.bar_minutes}m"
     for sym in SYMBOLS:
-        all_c = await fetch_candles(sym, fetch_days)
+        all_c = await fetch_candles(sym, fetch_days, interval=bar_interval)
         candles[sym] = all_c
         funding[sym] = await fetch_funding(sym, warmup_ts * 1000)
         print(f"  {sym}: {len(all_c)} candles, {len(funding[sym])} funding points")
@@ -260,6 +267,9 @@ async def main() -> None:
     btc_by_ts = {c["timestamp"]: c for c in candles["BTC"]}
     eth_by_ts = {c["timestamp"]: c for c in candles["ETH"]}
     boundary_printed = False
+    decision_step = max(1, round(args.decision_minutes / args.bar_minutes))
+    bph = max(1, 60 // args.bar_minutes)  # bars per hour: keeps grid-protection
+                                          # and baseline windows time-constant
 
     for i, ts in enumerate(timeline):
         prefix = resume_last_ts is not None and ts <= resume_last_ts
@@ -301,23 +311,27 @@ async def main() -> None:
         # 3. decision point
         if prefix:
             # rebuild follows the recorded decision timestamps exactly — the
-            # original run stepped by candle index, which drifts off the hour
-            # phase when candles are missing, so index alignment is impossible
+            # original run stepped by candle index, which drifts off the
+            # decision phase when candles are missing, so index alignment
+            # is impossible
             if float(ts) not in recorded_blocks and float(ts) not in recorded_closes:
                 continue
         elif resume_last_ts is not None:
-            if (ts - resume_last_ts) % (args.decision_hours * 3600) != 0:
+            if (ts - resume_last_ts) % (args.decision_minutes * 60) != 0:
                 continue
-        elif i % args.decision_hours != 0:
-            continue
-        summaries = {s: _summarize(candles[s], ts) for s in SYMBOLS}
-        if any(v is None for v in summaries.values()):
+        elif i % decision_step != 0:
             continue
         fr = {s: max((f for f in funding[s] if f <= ts), default=None) for s in SYMBOLS}
         fr = {s: (funding[s][f] if f else None) for s, f in fr.items()}
+        summaries = {s: compute_market_features(candles[s], upto_ts=ts,
+                                                funding_rate=fr[s],
+                                                bar_minutes=args.bar_minutes)
+                     for s in SYMBOLS}
+        if any(v is None for v in summaries.values()):
+            continue
         context = {
             "current_time_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts)),
-            "markets": {s: {**summaries[s], "funding_rate": fr[s]} for s in SYMBOLS},
+            "markets": summaries,
             "portfolio": {
                 "cash": round(cash, 2),
                 "open_positions": [
@@ -408,8 +422,11 @@ async def main() -> None:
             risk_status = "PASSED"
             rejection_reason = None
 
-            # objective features for the grid protection state machine
-            sym_candles = [c for c in candles[sym] if c["timestamp"] <= ts][-120:]
+            # objective features for the grid protection state machine —
+            # resampled back to 1h so its tuned EMA/ATR windows keep their
+            # original time semantics regardless of the decision bar size
+            sym_candles = _resample(
+                [c for c in candles[sym] if c["timestamp"] <= ts], bph)[-120:]
             grid_state = evaluate_grid_state(
                 compute_grid_features(sym_candles), regime=regime, config=settings)
 
@@ -561,8 +578,9 @@ async def main() -> None:
                     trend_pnl += pnl
                     trend_trades += 1
                     trend_pos = None
-            elif len(closes_so_far) >= 80 and \
-                    _ema(closes_so_far[-40:], 20) > _ema(closes_so_far[-80:], 50):
+            elif len(closes_so_far) >= 80 * bph and \
+                    _ema(closes_so_far[-40 * bph:], 20 * bph) > \
+                    _ema(closes_so_far[-80 * bph:], 50 * bph):
                 px_now = float(c["close"])
                 trend_pos = SimPosition(
                     sym, "LONG", px_now, POSITION_SIZE / px_now,
@@ -600,7 +618,8 @@ async def main() -> None:
 
     span_days = round((end_ts - start_ts) / 86400, 1)
     print("\n===== REPLAY RESULT =====")
-    print(f"experiment: {exp_id} ({span_days}d, decisions every {args.decision_hours}h)")
+    print(f"experiment: {exp_id} ({span_days}d, {args.bar_minutes}m bars, "
+          f"decisions every {args.decision_minutes}min)")
     print(f"agent:  final equity ${equity_curve[-1]['equity']:.2f}"
           f" (start $10,000) · return {agent_eq['total_return'] and round(agent_eq['total_return']*100, 2)}%"
           f" · maxDD {agent_eq['max_drawdown_pct'] and round(agent_eq['max_drawdown_pct'], 2)}%"
