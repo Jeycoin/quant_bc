@@ -160,6 +160,82 @@ class RiskValidator:
         return RiskReport(approved=not reasons, reasons=reasons)
 
 
+# -------------------------------------------------------------- entry gate
+
+def validate_entry(features: dict[str, Any] | None,
+                   action: str,
+                   regime: str | None = None,
+                   config: dict[str, Any] | None = None) -> RiskReport:
+    """Deterministic directional-entry gate (framework v0.5).
+
+    Evidence base (docs/research/crypto-quant-frontier-notes.md):
+    Elder's triple screen — the higher timeframe defines the tradeable
+    direction, the lower timeframe only times entries. Our replay evidence
+    matches: the LLM's 30-min direction calls had no edge (SHORT 0/4 wins,
+    longs stopped within 1-1.5h). So entries must align with objective
+    higher-horizon factors; the LLM's own regime call is NOT a gate input
+    for the hard rules (it is self-reported) except for the two regime
+    blocks below.
+
+    Hard rules (action LONG, mirrored for SHORT):
+    - regime TRENDING_BEAR blocks LONG (and TRENDING_BULL blocks SHORT)
+      when a regime is supplied
+    - regime RANGING blocks directional entries entirely — chop is for
+      grids, not positions
+    - EMA(8/21) cross must agree with the direction
+    - 8h momentum (ret_16bar_pct at 30m bars) must agree
+    - RSI guard: no LONG at rsi >= overbought, no SHORT at rsi <= oversold
+      (do not chase exhaustion)
+    - BREAKOUT entries need volume confirmation (|volume_z| >= threshold)
+    """
+    cfg = (config or {}).get("entry_gate", {})
+    if not cfg.get("enabled", True):
+        return RiskReport(approved=True)
+    rsi_ob = float(cfg.get("rsi_overbought", 75))
+    rsi_os = float(cfg.get("rsi_oversold", 25))
+    volz_min = float(cfg.get("breakout_volume_z", 1.0))
+
+    f = features or {}
+    action = (action or "").upper()
+    regime = (regime or "").upper()
+    if action not in ("LONG", "SHORT"):
+        return RiskReport(approved=True)
+
+    reasons: list[str] = []
+    counter = "TRENDING_BEAR" if action == "LONG" else "TRENDING_BULL"
+    if regime == counter:
+        reasons.append(f"counter-regime: {action} in {regime}")
+    if regime == "RANGING":
+        reasons.append(f"directional {action} disabled in RANGING "
+                       "(chop) — use grid or wait")
+
+    ema_cross = f.get("ema_cross")
+    want_cross = "BULL" if action == "LONG" else "BEAR"
+    if ema_cross and ema_cross != want_cross:
+        reasons.append(f"counter-trend: ema_cross={ema_cross}, want {want_cross}")
+
+    mom = f.get("ret_16bar_pct")  # 8h momentum at 30m bars
+    if mom is not None:
+        if action == "LONG" and mom < 0:
+            reasons.append(f"8h momentum negative ({mom}%)")
+        if action == "SHORT" and mom > 0:
+            reasons.append(f"8h momentum positive ({mom}%)")
+
+    rsi = f.get("rsi_14bar")
+    if rsi is not None:
+        if action == "LONG" and rsi >= rsi_ob:
+            reasons.append(f"RSI {rsi} >= {rsi_ob} — chasing exhaustion")
+        if action == "SHORT" and rsi <= rsi_os:
+            reasons.append(f"RSI {rsi} <= {rsi_os} — chasing exhaustion")
+
+    if regime == "BREAKOUT":
+        volz = f.get("volume_z_48bar")
+        if volz is None or abs(float(volz)) < volz_min:
+            reasons.append(f"breakout without volume confirmation "
+                           f"(volume_z={volz}, need >= {volz_min})")
+    return RiskReport(approved=not reasons, reasons=reasons)
+
+
 # --------------------------------------------------------- grid protection
 
 @dataclass

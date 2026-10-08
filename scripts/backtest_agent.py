@@ -17,11 +17,13 @@ Simplifications (all documented in the report):
   directional position when action=LONG/SHORT with confidence >= threshold
 - directional barriers are ATR-scaled by default (SL = 4x ATR14%, clamped to
   [sl_pct, 3x sl_pct]; TP = min(2.5x SL, 0.9x horizon sigma)) with a
-  breakeven stop that moves to entry after +1x SL favorable excursion —
-  the bt-replay-7d-aggressive lesson was that fixed 1% stops inside
-  multi-hour noise produce a structural 10:4 stop:take-profit ratio, and
-  the exp-5a5bc85adf5b lesson was that a TP beyond the holding horizon's
-  1-sigma move never triggers
+  breakeven stop that moves to entry after +1x SL favorable excursion and a
+  trailing stop 1x SL behind the extreme thereafter
+- framework v0.5 adds: a deterministic entry gate (8h momentum + EMA cross
+  + RSI guard + breakout volume confirmation; no directional trades in
+  RANGING), volatility-targeted sizing (2% equity risk per trade), and a
+  6h same-direction cooldown after stop-outs — see
+  docs/research/crypto-quant-frontier-notes.md
 
 Usage:
   python scripts/backtest_agent.py [--days 7] [--bar-minutes 30]
@@ -59,6 +61,7 @@ from agent.validators import (
     RiskValidator,
     compute_grid_features,
     evaluate_grid_state,
+    validate_entry,
 )
 from analytics.store import AnalyticsStore, new_decision_id
 from analytics.versioning import current_versions
@@ -89,14 +92,19 @@ RSI and ATR (1 bar = bar_minutes, so 8 bars = 4h at 30m bars); the 48-bar
 (24h) fields and funding_rate are slow background context. Simulated
 execution policy: strategy "grid" in a ranging regime opens a grid;
 LONG/SHORT at or above the configured confidence threshold opens a
-LEVERAGED directional position with ATR-scaled TP/SL and a breakeven stop
-(liquidation is simulated — high leverage can wipe out the margin on a
-modest adverse move); WAIT/WATCH does nothing. LONG and SHORT are fully
-symmetric in this replay — same costs, same barriers, both always
-available. This replay runs an aggressive risk profile: act decisively on
-high-conviction opportunities, but keep your confidence score honest —
-inflated confidence degrades the experiment. End your reply with one
-```analysis block per symbol.
+LEVERAGED directional position — but only if it passes the deterministic
+entry gate: direction must agree with 8h momentum (ret_16bar) and the
+EMA(8/21) cross, RSI extremes block chase entries, BREAKOUT needs volume
+confirmation (|volume_z| >= 1), and directional trades are disabled in
+RANGING (grids are for ranges). Positions use ATR-scaled TP/SL, a
+breakeven stop, a 1x-SL trailing stop, and volatility-targeted sizing
+(margin = 2% of equity risked per trade); liquidation is simulated —
+high leverage can wipe out the margin on a modest adverse move. After a
+stop-out, the same direction on that symbol cools down for 6h. WAIT/WATCH
+does nothing. LONG and SHORT are fully symmetric in this replay — same
+costs, same barriers, both always available. Keep your confidence score
+honest — inflated confidence degrades the experiment. End your reply with
+one ```analysis block per symbol.
 """
 
 
@@ -115,7 +123,23 @@ class SimPosition:
     tp_pct: float = POS_TP_PCT
     sl_pct: float = POS_SL_PCT
     breakeven: bool = False   # move SL to entry after +1x SL favorable excursion
+    trailing: bool = False    # after breakeven, trail 1x SL behind the extreme
     be_active: bool = False
+    trail_best: float = 0.0   # best favorable price seen since activation
+
+    def _stop_price(self) -> float:
+        """Current effective stop. Plain SL before activation; entry after
+        breakeven; trailed 1x sl_pct behind the favorable extreme when
+        trailing is on (never worse than entry once active)."""
+        if not self.be_active:
+            return self.entry * (1 - self.sl_pct) if self.side == "LONG" \
+                else self.entry * (1 + self.sl_pct)
+        if not self.trailing or not self.trail_best:
+            return float(self.entry)
+        dist = self.sl_pct * self.entry
+        if self.side == "LONG":
+            return max(float(self.entry), self.trail_best - dist)
+        return min(float(self.entry), self.trail_best + dist)
 
     def check_exit(self, c: dict, ts: float) -> tuple[float, str, float] | None:
         """Returns (net_pnl, reason, total_fees) or None.
@@ -125,14 +149,16 @@ class SimPosition:
         exchange's maintenance margin would liquidate slightly earlier).
         Breakeven: once price has moved +1x sl_pct in favor without touching
         the original stop, the stop moves to entry (a scratch exit still
-        pays fees). Intra-candle ambiguity resolves conservatively: if a
-        single candle touches both the trigger and the original stop, the
-        stop is assumed hit first.
+        pays fees). Trailing (QuantPedia D1H1 lesson: trailing exits beat
+        fixed TP in trend regimes): once active, the stop trails 1x sl_pct
+        behind the best favorable price. Intra-candle ambiguity resolves
+        conservatively: if a single candle touches both the trigger and the
+        stop, the stop is assumed hit first; the trailing extreme updates
+        only on candles where no exit fired.
         """
         high, low, close = float(c["high"]), float(c["low"]), float(c["close"])
-        sl_pct_eff = 0.0 if self.be_active else self.sl_pct
+        sl = self._stop_price()
         tp = self.entry * (1 + self.tp_pct) if self.side == "LONG" else self.entry * (1 - self.tp_pct)
-        sl = self.entry * (1 - sl_pct_eff) if self.side == "LONG" else self.entry * (1 + sl_pct_eff)
         liq = self.entry * (1 - 1 / self.leverage) if self.side == "LONG" \
             else self.entry * (1 + 1 / self.leverage)
         sign = 1 if self.side == "LONG" else -1
@@ -143,23 +169,34 @@ class SimPosition:
         elif self.side == "SHORT" and high >= liq and liq < sl:
             exit_price, reason = liq, "LIQUIDATION"
         elif self.side == "LONG" and low <= sl:
-            exit_price, reason = sl, "BREAKEVEN_EXIT" if self.be_active else "STOP_LOSS"
+            exit_price = sl
+            reason = "STOP_LOSS" if not self.be_active else (
+                "TRAIL_EXIT" if self.trailing and sl > self.entry else "BREAKEVEN_EXIT")
         elif self.side == "SHORT" and high >= sl:
-            exit_price, reason = sl, "BREAKEVEN_EXIT" if self.be_active else "STOP_LOSS"
+            exit_price = sl
+            reason = "STOP_LOSS" if not self.be_active else (
+                "TRAIL_EXIT" if self.trailing and sl < self.entry else "BREAKEVEN_EXIT")
         elif self.side == "LONG" and high >= tp:
             exit_price, reason = tp, "TAKE_PROFIT"
         elif self.side == "SHORT" and low <= tp:
             exit_price, reason = tp, "TAKE_PROFIT"
         elif ts >= self.deadline:
             exit_price, reason = close, "TIME_LIMIT"
-        if exit_price is None and self.breakeven and not self.be_active:
+        if exit_price is None and (self.breakeven or self.trailing):
             trigger = self.entry * (1 + self.sl_pct) if self.side == "LONG" \
                 else self.entry * (1 - self.sl_pct)
             orig_sl_hit = (low <= self.entry * (1 - self.sl_pct)) if self.side == "LONG" \
                 else (high >= self.entry * (1 + self.sl_pct))
             trig_hit = (high >= trigger) if self.side == "LONG" else (low <= trigger)
-            if trig_hit and not orig_sl_hit:
-                self.be_active = True
+            if not self.be_active:
+                if trig_hit and not orig_sl_hit:
+                    self.be_active = True
+                    self.trail_best = high if self.side == "LONG" else low
+            elif self.trailing:
+                if self.side == "LONG":
+                    self.trail_best = max(self.trail_best, high)
+                else:
+                    self.trail_best = min(self.trail_best, low)
         if exit_price is None:
             return None
         gross = (exit_price - self.entry) * self.qty * sign
@@ -225,6 +262,17 @@ def position_barriers(atr_pct: float | None, args,
     return args.tp_pct, args.sl_pct
 
 
+def position_margin_for(equity: float, sl_pct: float, args) -> float:
+    """Volatility-targeted margin (framework v0.5): risk a fixed fraction of
+    equity per trade — margin x leverage x SL% = equity x risk_pct. Wider
+    (high-vol) stops automatically shrink the position. Capped at
+    --position-margin, floored at 50 so the sim stays meaningful."""
+    if args.risk_per_trade_pct > 0 and sl_pct > 0 and args.leverage > 0:
+        m = equity * args.risk_per_trade_pct / (args.leverage * sl_pct)
+        return min(max(m, 50.0), args.position_margin)
+    return args.position_margin
+
+
 async def fetch_funding(coin: str, start_ms: int) -> dict[float, float]:
     # trust_env=False: see fetch_candles in backtest_grid.py
     async with httpx.AsyncClient(base_url="https://api.hyperliquid.xyz",
@@ -264,6 +312,16 @@ async def main() -> None:
     parser.add_argument("--no-breakeven", action="store_true",
                         help="disable breakeven stop (default: SL moves to entry "
                              "after +1x SL favorable excursion)")
+    parser.add_argument("--no-trailing", action="store_true",
+                        help="disable trailing stop (default: once at breakeven, "
+                             "the stop trails 1x SL behind the favorable extreme)")
+    parser.add_argument("--risk-per-trade-pct", type=float, default=0.02,
+                        help="volatility-targeted sizing: margin = equity x this "
+                             "/ (leverage x SL%%), capped by --position-margin; "
+                             "0 disables (fixed margin)")
+    parser.add_argument("--cooldown-hours", type=float, default=6.0,
+                        help="after a STOP_LOSS/LIQUIDATION, block same-symbol "
+                             "same-side entries for this many hours; 0 disables")
     parser.add_argument("--min-confidence", type=float, default=MIN_CONFIDENCE)
     parser.add_argument("--grid-size", type=float, default=GRID_SIZE)
     parser.add_argument("--max-total-exposure", type=float, default=None,
@@ -349,6 +407,9 @@ async def main() -> None:
     risk_note = (f"lev={leverage:g}x margin={margin:g} notional={notional:g} "
                  f"tp={args.tp_pct:g} sl={args.sl_pct:g} sl_atr_mult={args.sl_atr_mult:g} "
                  f"rr={args.rr:g} breakeven={not args.no_breakeven} "
+                 f"trailing={not args.no_trailing} "
+                 f"risk_per_trade={args.risk_per_trade_pct:g} "
+                 f"cooldown_h={args.cooldown_hours:g} "
                  f"min_conf={args.min_confidence:g}")
     if exp_id is None:
         exp_id = store.start_experiment(
@@ -372,6 +433,7 @@ async def main() -> None:
     equity_curve: list[dict] = []
     trade_count = 0
     consecutive_llm_errors = 0
+    cooldown_until: dict[tuple[str, str], float] = {}  # (symbol, side) -> ts
 
     timeline = [c["timestamp"] for c in candles["BTC"] if start_ts <= c["timestamp"] <= end_ts]
     btc_by_ts = {c["timestamp"]: c for c in candles["BTC"]}
@@ -393,6 +455,8 @@ async def main() -> None:
                 pnl, reason, fees = result
                 cash += pos.margin + pnl
                 positions.remove(pos)
+                if reason in ("STOP_LOSS", "LIQUIDATION") and args.cooldown_hours > 0:
+                    cooldown_until[(pos.symbol, pos.side)] = ts + args.cooldown_hours * 3600
                 if not prefix:
                     store.upsert_trade_event(
                         executor_id=pos.executor_id, ts_open=pos.opened_ts, ts_close=ts,
@@ -530,7 +594,8 @@ async def main() -> None:
                             rec.get("market_regime"),
                             margin=margin, leverage=leverage,
                             tp_pct=tp_eff, sl_pct=sl_eff,
-                            breakeven=not args.no_breakeven))
+                            breakeven=not args.no_breakeven,
+                            trailing=not args.no_trailing))
                         cash -= margin
                         trade_count += 1
                 continue
@@ -562,7 +627,7 @@ async def main() -> None:
                     risk = risk_validator.validate(
                         symbol=sym, new_exposure_quote=args.grid_size,
                         current_exposure_quote=args.grid_size * len(grids)
-                        + notional * len(positions),
+                        + sum(p.margin * p.leverage for p in positions),
                         symbol_exposure_quote=0.0)
                     if not risk.approved:
                         rejection = ("RISK_REJECTED", "; ".join(risk.reasons))
@@ -592,32 +657,52 @@ async def main() -> None:
                     regime_at_entry=g.regime_at_entry,
                     source="agent", experiment_id=exp_id)
             if action in ("LONG", "SHORT") and conf >= args.min_confidence \
-                    and not any(p.symbol == sym for p in positions) and cash >= margin:
-                tp_eff, sl_eff = position_barriers(
-                    summaries[sym].get("atr_14bar_pct"), args,
-                    bar_seconds=args.bar_minutes * 60)
-                cost = cost_validator.validate_position(notional, tp_eff)
-                if not cost.approved:
-                    risk_status, rejection_reason = "COST_REJECTED", cost.summary()
+                    and not any(p.symbol == sym for p in positions):
+                # 0. deterministic entry gate (framework v0.5): direction
+                #    must align with 8h momentum / EMA cross / RSI / volume;
+                #    stop-out cooldown blocks re-entry into the same chop
+                gate = validate_entry(summaries[sym], action, regime,
+                                      config=settings)
+                if not gate.approved:
+                    risk_status = "ENTRY_REJECTED"
+                    rejection_reason = "; ".join(gate.reasons)
+                elif ts < cooldown_until.get((sym, action), 0):
+                    risk_status = "COOLDOWN"
+                    rejection_reason = (f"{sym} {action} in post-stop cooldown "
+                                        f"({args.cooldown_hours:g}h)")
                 else:
-                    risk = risk_validator.validate(
-                        symbol=sym, new_exposure_quote=notional,
-                        current_exposure_quote=args.grid_size * len(grids)
-                        + notional * len(positions),
-                        symbol_exposure_quote=notional *
-                        sum(1 for p in positions if p.symbol == sym))
-                    if not risk.approved:
-                        risk_status, rejection_reason = "RISK_REJECTED", "; ".join(risk.reasons)
+                    tp_eff, sl_eff = position_barriers(
+                        summaries[sym].get("atr_14bar_pct"), args,
+                        bar_seconds=args.bar_minutes * 60)
+                    margin_eff = position_margin_for(equity, sl_eff, args)
+                    notional_eff = margin_eff * leverage
+                    if cash < margin_eff:
+                        risk_status, rejection_reason = "RISK_REJECTED", "insufficient cash"
                     else:
-                        execution_id = f"bt-pos-{sym}-{int(ts)}"
-                        positions.append(SimPosition(
-                            sym, action, price, notional / price,
-                            ts + POS_TIME_LIMIT_S, ts, execution_id, regime,
-                            margin=margin, leverage=leverage,
-                            tp_pct=tp_eff, sl_pct=sl_eff,
-                            breakeven=not args.no_breakeven))
-                        cash -= margin
-                        trade_count += 1
+                        cost = cost_validator.validate_position(notional_eff, tp_eff)
+                        if not cost.approved:
+                            risk_status, rejection_reason = "COST_REJECTED", cost.summary()
+                        else:
+                            risk = risk_validator.validate(
+                                symbol=sym, new_exposure_quote=notional_eff,
+                                current_exposure_quote=args.grid_size * len(grids)
+                                + sum(p.margin * p.leverage for p in positions),
+                                symbol_exposure_quote=sum(
+                                    p.margin * p.leverage for p in positions
+                                    if p.symbol == sym))
+                            if not risk.approved:
+                                risk_status, rejection_reason = "RISK_REJECTED", "; ".join(risk.reasons)
+                            else:
+                                execution_id = f"bt-pos-{sym}-{int(ts)}"
+                                positions.append(SimPosition(
+                                    sym, action, price, notional_eff / price,
+                                    ts + POS_TIME_LIMIT_S, ts, execution_id, regime,
+                                    margin=margin_eff, leverage=leverage,
+                                    tp_pct=tp_eff, sl_pct=sl_eff,
+                                    breakeven=not args.no_breakeven,
+                                    trailing=not args.no_trailing))
+                                cash -= margin_eff
+                                trade_count += 1
 
             store.record_decision_event(
                 decision_id=decision_id if sym == SYMBOLS[0] else new_decision_id(),
@@ -720,7 +805,8 @@ async def main() -> None:
                     f"bt-baseline-trend-{sym}-{int(c['timestamp'])}", None,
                     margin=margin, leverage=leverage,
                     tp_pct=tp_b, sl_pct=sl_b,
-                    breakeven=not args.no_breakeven)
+                    breakeven=not args.no_breakeven,
+                    trailing=not args.no_trailing)
         if trend_pos is not None:
             sign = 1
             fees = (trend_pos.entry + last) * trend_pos.qty * FEE_RATE
@@ -748,6 +834,9 @@ async def main() -> None:
                          "sl_pct": args.sl_pct,
                          "sl_atr_mult": args.sl_atr_mult, "rr": args.rr,
                          "breakeven": not args.no_breakeven,
+                         "trailing": not args.no_trailing,
+                         "risk_per_trade_pct": args.risk_per_trade_pct,
+                         "cooldown_hours": args.cooldown_hours,
                          "min_confidence": args.min_confidence,
                          "grid_size": args.grid_size,
                          "bar_minutes": args.bar_minutes,

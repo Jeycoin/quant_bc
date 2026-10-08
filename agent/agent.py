@@ -37,6 +37,7 @@ from agent.validators import (
     RiskValidator,
     compute_grid_features,
     evaluate_grid_state,
+    validate_entry,
 )
 from analytics.store import AnalyticsStore, new_decision_id
 from analytics.versioning import current_versions
@@ -461,6 +462,18 @@ class TradingAgent:
                     "GRID_REJECTED",
                 )
 
+        # 1.5 Entry gate (framework v0.5): directional positions must align
+        #     with objective higher-horizon factors (8h momentum, EMA cross,
+        #     RSI guard). Fail-open when features are unavailable — the
+        #     cost/risk gates below still apply.
+        if "position" in etype:
+            gate = await self._entry_gate_check(cfg)
+            if gate is not None and not gate.approved:
+                return (
+                    "ENTRY GATE — REJECTED: " + "; ".join(gate.reasons),
+                    "ENTRY_REJECTED",
+                )
+
         # 2. Cost validator: positive expected economics after fees,
         #    slippage and safety margin. Fails closed when the notional
         #    cannot be determined (no economics data -> no trade).
@@ -490,6 +503,55 @@ class TradingAgent:
             return "RISK VALIDATOR — REJECTED: " + "; ".join(risk.reasons), \
                 "RISK_REJECTED"
         return None, None
+
+    async def _entry_gate_check(self, cfg: dict[str, Any]):
+        """Entry gate for position executors: objective 30m market features
+        for the target symbol, validated by agent.validators.validate_entry.
+        The LLM's regime call is not available here (executor configs do not
+        carry it), so only the objective rules apply. Returns None when side
+        or features cannot be determined (fail open)."""
+        pair = str(cfg.get("trading_pair", ""))
+        base = pair.partition("-")[0]
+        side_raw = cfg.get("side")
+        side_map = {1: "LONG", 2: "SHORT", "1": "LONG", "2": "SHORT",
+                    "BUY": "LONG", "SELL": "SHORT", "LONG": "LONG",
+                    "SHORT": "SHORT", "buy": "LONG", "sell": "SHORT"}
+        action = side_map.get(side_raw)
+        if not base or not action:
+            return None
+        try:
+            from agent.market_features import MIN_BARS, compute_market_features
+
+            bar = os.getenv("FEATURE_BAR", "30m")
+            data = await self._hb_rest("POST", "/market-data/candles", {
+                "connector_name": os.getenv("MARKET_PROBE_CONNECTOR",
+                                            "hyperliquid_perpetual"),
+                "trading_pair": f"{base}-USD",
+                "interval": bar, "max_records": 120,
+            })
+            rows = data.get("candles", data) if isinstance(data, dict) else data
+            candles = []
+            for c in rows or []:
+                try:
+                    ts = float(c["timestamp"])
+                    candles.append({
+                        "timestamp": ts / 1000 if ts > 1e12 else ts,
+                        "open": float(c["open"]), "high": float(c["high"]),
+                        "low": float(c["low"]), "close": float(c["close"]),
+                        "volume": float(c.get("volume", 0) or 0),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+            candles.sort(key=lambda c: c["timestamp"])
+            if len(candles) < MIN_BARS:
+                candles = await self._public_candles(base, bar)
+            features = compute_market_features(candles)
+            if not features:
+                return None
+            return validate_entry(features, action, regime=None,
+                                  config=self.guard.config)
+        except Exception:
+            return None
 
     async def _grid_state(self, cfg: dict[str, Any]):
         """Evaluate the grid protection state from objective 1h candles.

@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from backtest_agent import SimPosition, position_barriers  # noqa: E402
+from backtest_agent import SimPosition, position_barriers, position_margin_for  # noqa: E402
 
 
 class _Args:
@@ -92,3 +92,41 @@ def test_short_breakeven_symmetric():
     assert p.be_active
     out = p.check_exit({"high": 100.05, "low": 99.2, "close": 100.0}, 2)
     assert out is not None and out[1] == "BREAKEVEN_EXIT"
+
+
+def test_trailing_locks_in_profit():
+    p = _pos(sl_pct=0.01, tp_pct=0.10, breakeven=True, trailing=True)
+    # +1.5%: activates breakeven and seeds the trail at the candle high
+    assert p.check_exit({"high": 101.5, "low": 99.6, "close": 101.4}, 1) is None
+    assert p.be_active
+    # +4%: trail extends; stop should now sit at 103.0 (104 - 1% of entry)
+    assert p.check_exit({"high": 104.0, "low": 100.9, "close": 103.8}, 2) is None
+    # retrace to 102.9 low -> stopped at 103.0, locking +3% gross
+    out = p.check_exit({"high": 103.4, "low": 102.9, "close": 103.0}, 3)
+    assert out is not None and out[1] == "TRAIL_EXIT"
+    assert out[0] > 0  # profitable despite being "stopped out"
+
+
+def test_trailing_never_below_entry():
+    p = _pos(sl_pct=0.01, tp_pct=0.10, breakeven=True, trailing=True)
+    p.check_exit({"high": 101.5, "low": 99.6, "close": 101.2}, 1)
+    # trails 1x SL (1.0) behind the activation candle's high (101.5),
+    # and never below entry (100.0)
+    assert p._stop_price() == 100.5
+    assert p._stop_price() >= p.entry
+
+
+def test_position_margin_for_vol_targeting():
+    class A:
+        risk_per_trade_pct = 0.02
+        leverage = 5.0
+        position_margin = 2000.0
+    # equity 10k, SL 1%: margin = 200 / (5 x 0.01) = 4000 -> capped at 2000
+    assert position_margin_for(10_000, 0.01, A) == 2000.0
+    # SL 2%: margin = 200 / (5 x 0.02) = 2000
+    assert position_margin_for(10_000, 0.02, A) == 2000.0
+    # SL 4%: margin = 200 / (5 x 0.04) = 1000 — wider stop, smaller size
+    assert position_margin_for(10_000, 0.04, A) == 1000.0
+    # disabled -> fixed margin
+    A.risk_per_trade_pct = 0.0
+    assert position_margin_for(10_000, 0.02, A) == 2000.0
