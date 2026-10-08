@@ -64,3 +64,9 @@ entry_gate:
   rsi_overbought: 75
   rsi_oversold: 25
   breakout_volume_z: 1.0
+  # v0.8 pullback discipline (replay evidence exp-2e40edd765ca: chasing the
+  # top of the 4h range was the biggest long-side loss source).
+  # null disables either rule.
+  long_max_pos: 0.6      # LONG only in the lower 60% of the 8-bar range
+  short_min_pos: 0.4     # SHORT only in the upper 60%
+  min_vol_ratio: 0.7     # block entries when vol_8bar/vol_48bar collapses

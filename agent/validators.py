@@ -226,6 +226,16 @@ def validate_entry(features: dict[str, Any] | None,
     - RSI guard: no LONG at rsi >= overbought, no SHORT at rsi <= oversold
       (do not chase exhaustion)
     - BREAKOUT entries need volume confirmation (|volume_z| >= threshold)
+    - Pullback discipline (v0.8, Raschke Holy Grail + our replay evidence
+      exp-2e40edd765ca: LONGs entered in the top 30% of the 4h range lost
+      -9.42 over 22 trades): LONG only in the lower part of the 8-bar
+      range (pos <= long_max_pos), SHORT only in the upper part
+      (pos >= short_min_pos). Buy dips in uptrends, sell rallies in
+      downtrends — never chase.
+    - Dead-market guard (v0.8, same experiment: entries while short-term
+      vol was collapsed vs the daily backdrop lost -5.34 over 20 trades,
+      all churned out by time-stops): no directional entries when
+      realized_vol_8bar / realized_vol_48bar < min_vol_ratio.
     """
     cfg = (config or {}).get("entry_gate", {})
     if not cfg.get("enabled", True):
@@ -233,6 +243,12 @@ def validate_entry(features: dict[str, Any] | None,
     rsi_ob = float(cfg.get("rsi_overbought", 75))
     rsi_os = float(cfg.get("rsi_oversold", 25))
     volz_min = float(cfg.get("breakout_volume_z", 1.0))
+    long_max_pos = cfg.get("long_max_pos", 0.6)
+    long_max_pos = None if long_max_pos is None else float(long_max_pos)
+    short_min_pos = cfg.get("short_min_pos", 0.4)
+    short_min_pos = None if short_min_pos is None else float(short_min_pos)
+    min_vol_ratio = cfg.get("min_vol_ratio", 0.7)
+    min_vol_ratio = None if min_vol_ratio is None else float(min_vol_ratio)
 
     f = features or {}
     action = (action or "").upper()
@@ -276,6 +292,27 @@ def validate_entry(features: dict[str, Any] | None,
         if volz is None or abs(float(volz)) < volz_min:
             reasons.append(f"breakout without volume confirmation "
                            f"(volume_z={volz}, need >= {volz_min})")
+
+    # v0.8: pullback discipline — enter with the higher-timeframe trend but
+    # only on pullbacks, never at the extreme of the short-term range
+    pos8 = (f.get("range_8bar") or {}).get("pos")
+    if pos8 is not None:
+        if action == "LONG" and long_max_pos is not None and pos8 > long_max_pos:
+            reasons.append(f"chasing: LONG at range_8bar pos {pos8} "
+                           f"> {long_max_pos} — wait for a pullback")
+        if action == "SHORT" and short_min_pos is not None and pos8 < short_min_pos:
+            reasons.append(f"chasing: SHORT at range_8bar pos {pos8} "
+                           f"< {short_min_pos} — wait for a rally")
+
+    # v0.8: dead-market guard — collapsed short-term vol means no momentum
+    # behind any entry; such positions historically churn to time-stops
+    v8 = f.get("realized_vol_8bar_pct")
+    v48 = f.get("realized_vol_48bar_pct")
+    if min_vol_ratio is not None and v8 is not None and v48:
+        vratio = v8 / v48
+        if vratio < min_vol_ratio:
+            reasons.append(f"dead market: vol_8bar/vol_48bar {vratio:.2f} "
+                           f"< {min_vol_ratio} — no momentum to capture")
     return RiskReport(approved=not reasons, reasons=reasons)
 
 

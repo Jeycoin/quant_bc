@@ -71,3 +71,43 @@ def test_gate_disabled():
 def test_non_directional_actions_pass():
     assert validate_entry(BEAR_FEATURES, "WAIT", "RANGING", CFG).approved
     assert validate_entry(None, "WATCH", None, CFG).approved
+
+
+def test_v08_pullback_gate_blocks_chasing():
+    cfg = {"entry_gate": {"enabled": True, "long_max_pos": 0.6,
+                          "short_min_pos": 0.4, "min_vol_ratio": None}}
+    base = {"ema_cross": "BULL", "ret_16bar_pct": 1.5, "rsi_14bar": 50,
+            "realized_vol_8bar_pct": 0.5, "realized_vol_48bar_pct": 0.5}
+    # LONG at the top of the 4h range -> rejected
+    f = {**base, "range_8bar": {"high": 105, "low": 100, "pos": 0.85}}
+    assert not validate_entry(f, "LONG", config=cfg).approved
+    # LONG on a pullback -> passes the pullback rule
+    f2 = {**base, "range_8bar": {"high": 105, "low": 100, "pos": 0.35}}
+    assert validate_entry(f2, "LONG", config=cfg).approved
+    # mirror: SHORT at the bottom of the range -> rejected
+    fb = {**base, "ema_cross": "BEAR", "ret_16bar_pct": -1.5,
+          "range_8bar": {"high": 105, "low": 100, "pos": 0.15}}
+    assert not validate_entry(fb, "SHORT", config=cfg).approved
+    fb2 = {**base, "ema_cross": "BEAR", "ret_16bar_pct": -1.5,
+           "range_8bar": {"high": 105, "low": 100, "pos": 0.7}}
+    assert validate_entry(fb2, "SHORT", config=cfg).approved
+
+
+def test_v08_dead_market_guard():
+    cfg = {"entry_gate": {"enabled": True, "long_max_pos": None,
+                          "short_min_pos": None, "min_vol_ratio": 0.7}}
+    base = {"ema_cross": "BULL", "ret_16bar_pct": 1.5, "rsi_14bar": 50}
+    f = {**base, "realized_vol_8bar_pct": 0.2, "realized_vol_48bar_pct": 0.5}
+    r = validate_entry(f, "LONG", config=cfg)
+    assert not r.approved and any("dead market" in x for x in r.reasons)
+    f2 = {**base, "realized_vol_8bar_pct": 0.6, "realized_vol_48bar_pct": 0.5}
+    assert validate_entry(f2, "LONG", config=cfg).approved
+
+
+def test_v08_gates_disabled_with_null():
+    cfg = {"entry_gate": {"enabled": True, "long_max_pos": None,
+                          "short_min_pos": None, "min_vol_ratio": None}}
+    f = {"ema_cross": "BULL", "ret_16bar_pct": 1.5, "rsi_14bar": 50,
+         "range_8bar": {"high": 105, "low": 100, "pos": 0.99},
+         "realized_vol_8bar_pct": 0.05, "realized_vol_48bar_pct": 0.5}
+    assert validate_entry(f, "LONG", config=cfg).approved

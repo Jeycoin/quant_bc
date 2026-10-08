@@ -95,11 +95,20 @@ calls had no edge). The gate checks OBJECTIVE factors, not your prose:
 - No LONG when `rsi_14bar` >= 75, no SHORT when it <= 25 (exhaustion).
 - BREAKOUT entries need volume confirmation (`volume_z_48bar` >= 1).
 - No directional positions in RANGING — ranges are for grids.
+- Pullback discipline (v0.8): enter WITH the higher-timeframe trend but
+  only on pullbacks — LONG requires `range_8bar.pos` <= 0.6, SHORT
+  requires it >= 0.4. Chasing the top of the 4h range was the biggest
+  loss source in replay evidence. If the trend is strong but price is
+  extended, WAIT for the dip instead of entering.
+- Dead-market guard (v0.8): no directional entries when short-term vol
+  has collapsed (`realized_vol_8bar_pct / realized_vol_48bar_pct < 0.7`)
+  — such positions historically churned to time-stops.
 
 Check these factors BEFORE proposing LONG/SHORT; a proposal that fails the
-gate is rejected as ENTRY_REJECTED and recorded. After a stop-out on a
-symbol, cool down: do not re-enter the same direction for at least 6 hours
-— re-entering the same chop immediately is a top loss source.
+gate is rejected as ENTRY_REJECTED and recorded. After a stop-out OR a
+time-stop on a symbol, cool down: do not re-enter the same direction for
+at least 6 hours — re-entering the same chop immediately is a top loss
+source (the SUI churn lesson: 14 time-stops in 7 days on one symbol).
 
 # Position barriers (directional trades)
 

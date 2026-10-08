@@ -486,7 +486,12 @@ async def main() -> None:
                 pnl, reason, fees = result
                 cash += pos.margin + pnl
                 positions.remove(pos)
-                if reason in ("STOP_LOSS", "LIQUIDATION") and args.cooldown_hours > 0:
+                # v0.8: TIME_STOP joins the cooldown trigger. A time-stopped
+                # position means the thesis had no momentum — re-entering the
+                # same chop immediately was the SUI churn loss source
+                # (14 time-stops in 7d, -13.13 net on one symbol)
+                if reason in ("STOP_LOSS", "LIQUIDATION", "TIME_STOP") \
+                        and args.cooldown_hours > 0:
                     cooldown_until[(pos.symbol, pos.side)] = ts + args.cooldown_hours * 3600
                 if not prefix:
                     store.upsert_trade_event(
@@ -602,7 +607,8 @@ async def main() -> None:
             blocks = extract_analysis_blocks(answer)
             if not blocks:
                 store.record_decision_event(
-                    decision_id=decision_id, mode="BACKTEST", action="SCAN",
+                    decision_id=decision_id, ts=float(ts), mode="BACKTEST",
+                    action="SCAN",
                     outcome_status="NO_BLOCK", market_context=context,
                     portfolio_context=context["portfolio"], experiment_id=exp_id,
                     llm_model=llm.model,
