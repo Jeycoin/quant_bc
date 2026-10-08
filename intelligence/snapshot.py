@@ -11,6 +11,7 @@ from dataclasses import asdict
 from typing import Any
 
 from intelligence.features import (
+    build_derivatives_features,
     build_news_features,
     build_onchain_features,
     build_social_features,
@@ -30,6 +31,7 @@ def build_snapshot(
     data (the intelligence layer never fetches prices itself)."""
     social = build_social_features(store, symbols)
     onchain = build_onchain_features(store, symbols)
+    derivatives = build_derivatives_features(store, symbols)
     news = build_news_features(store, symbols)
 
     engine = NarrativeEngine()
@@ -49,6 +51,7 @@ def build_snapshot(
     return IntelSnapshot(
         social=social,
         onchain=onchain,
+        derivatives=derivatives,
         news=news["top_events"],
         narratives=narratives,
         meta={"news_volume": {s: (news["symbols"].get(s) or {})

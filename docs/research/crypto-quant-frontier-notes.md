@@ -137,3 +137,67 @@ evidence 中应被标注为弱证据。
 - 轮动判断必须结合绝对方向,不能单独用相对强弱。
 
 **含义**:框架中 `rotation` 字段由相对分数差 + BTC 绝对方向联合判定。
+
+---
+
+# 短线交易决策框架研究(2026-10,v0.5.1 改造依据)
+
+## 11. 日内季节性:成交量/波动率有稳定的时段结构
+
+来源:[Petrov/Golub/Olsen — Instantaneous Volatility Seasonality of Bitcoin](https://smallake.kr/wp-content/uploads/2019/02/SSRN-id3243797.pdf)、[UNSW Hawkes 模型研究(周日/周一异常)](https://unsworks.unsw.edu.au/bitstreams/44b2fb76-1683-427f-9b56-d110e739e13b/download)、[MQL5 同时段归一化指标](https://www.mql5.com/en/market/product/193758)
+
+- BTC 成交量与波动率呈稳定 U 型日内曲线(美盘时段高、亚洲凌晨低),
+  且周日/周一有日历异常。
+- **含义**:全局 24h 基线的 volume_z 在安静时段高估异常、在繁忙时段
+  低估异常。正确做法是同时段(time-of-day)归一化后再算 z。
+- **已实现**:`compute_market_features` 新增 `volume_z_deseason`
+  (7 天同时段 profile 去季节化,≥4 天历史才输出,否则 None 回退);
+  BREAKOUT 入场门优先使用它。
+
+## 12. Funding 是真实持仓成本,不只是情绪指标
+
+来源:[BloFin — Funding + Open Interest: Signals Traders Use (and Misuse)](https://blofin.com/en/academy/education/trading/funding-and-open-interest-signals)
+
+- 永续每 8h 结算 funding;多头在 funding>0 时付费,空头在 funding<0 时
+  付费。短线持仓跨一个结算窗口就产生真实现金流。
+- 高 OI 环境下清算缓冲规则:入场价距清算价 ≥20-30%。
+- **已实现**:CostValidator 新增 funding 成本(只在付费方向收取,
+  收入方向永不计入——保守原则);`cost.funding_interval_hours` /
+  `cost.expected_hold_hours` 可配。回放与实时共用。
+
+## 13. OI(持仓量)是短线衍生品情报的核心缺口
+
+来源:BloFin(同上)、[清算瀑布研究汇总](https://www.kucoin.com/blog/jp-why-bitcoin-futures-trading-can-cause-a-liquidation-cascade)
+
+- 价涨 + OI 增 = 新钱进场(较可持续);价涨 + OI 降 = 空头回补
+  (脆弱,易回落)。突破确认只有成交量没有 OI 是半盲的。
+- 高 OI + 极端 funding = 拥挤,清算瀑布易发 → 应触发风险升级而非追单。
+- **已实现**:HyperliquidDeriv provider(公共 API,与行情同源),
+  采集 open_interest(USD 名义)与 funding_rate;features 层输出
+  `oi_change_pct`(~24h 窗口);snapshot 新增 derivatives 区,
+  可经 INTEL_SECTIONS 做消融实验。
+- **未做**:清算热力图(Coinglass 需 key,列为下一步);事件驱动
+  风险升级(30min 周期外的波动冲击检测,写入设计文档 v0.6.1)。
+
+## 14. 短线 time-stop:不动的仓位就是错的仓位
+
+来源:短线交易通则(QuantPedia 多 timeframe 研究中 trailing/time exit
+的组合实践)+ 本系统回放证据(亏损单平均 1-1.5h 内止损,盈利单很快
+进入盈利区)。
+
+- 入场后数小时内未达 +1×SL 的仓位,方向判断大概率错误;
+  24h TIME_LIMIT 对短线系统太松,让死仓位持续捐手续费与 funding。
+- **已实现**:回放 `--time-stop-hours 6`(默认):6h 未激活保本即
+  市价离场(TIME_STOP);已进入盈利区的仓位不受影响(trailing 接管)。
+  实时路径由 prompt 纪律承载(Hummingbot executor 无原生 time-stop)。
+
+## 改造决策汇总(v0.5.1)
+
+| # | 改造 | 依据 | 实现位置 |
+|---|---|---|---|
+| 1 | volume_z 去季节化(同时段 7 天 profile) | §11 | `market_features._deseasonalized_volume_z`,入场门优先使用 |
+| 2 | Cost Validator 计入 funding 成本(只收不贷) | §12 | `CostValidator._funding_cost`,回放+实时共用 |
+| 3 | 回放 time-stop 6h(未激活保本即离场) | §14 | `SimPosition.time_stop_s`,`--time-stop-hours` |
+| 4 | OI/funding 衍生品情报层(Hyperliquid 公共 API) | §13 | `HyperliquidDeriv` provider + derivatives snapshot 区 |
+| 5 | 实时特征历史加深(120→400 bars / 公共回退 48→200h) | §11 | `agent.py` 特征获取 |
+| 6 | prompt:OI 解读、funding 成本意识、time-stop 纪律 | §12-14 | `trading_manager.md` |

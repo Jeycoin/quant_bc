@@ -17,6 +17,55 @@ from __future__ import annotations
 from typing import Any
 
 MIN_BARS = 50  # need >= 48 bars for the 24h window plus EMA warm-up
+DESEASON_MIN_DAYS = 4   # need >= 4 days of bars for a time-of-day baseline
+DESEASON_DAYS = 7       # trailing days used for the volume profile
+
+
+def _deseasonalized_volume_z(candles: list[dict], bar_minutes: int) -> float | None:
+    """Volume z-score after removing the intraday seasonality profile.
+
+    Crypto volume has a strong U-shaped time-of-day pattern (US hours busy,
+    Asia late night thin — see docs/research/crypto-quant-frontier-notes.md
+    §11). A plain 24h z-score therefore overstates anomalies in quiet hours
+    and understates them in busy hours. Here each bar's volume is divided by
+    its time-of-day profile factor (trailing DESEASON_DAYS mean at the same
+    slot / trailing global mean), then z-scored against the trailing 48
+    adjusted bars — the same window as the raw z for comparability.
+
+    Returns None when history is insufficient (< DESEASON_MIN_DAYS days);
+    callers must fall back to the raw volume_z_48bar.
+    """
+    if bar_minutes <= 0 or 1440 % bar_minutes != 0:
+        return None
+    slots = 1440 // bar_minutes
+    need = slots * DESEASON_MIN_DAYS
+    if len(candles) < need + 49:
+        return None
+    hist = candles[-(slots * DESEASON_DAYS + 49):]
+    bar_s = bar_minutes * 60
+    slot_sum = [0.0] * slots
+    slot_n = [0] * slots
+    for c in hist[:-1]:  # profile excludes the current bar
+        slot = int(c["timestamp"] // bar_s) % slots
+        slot_sum[slot] += float(c.get("volume", 0) or 0)
+        slot_n[slot] += 1
+    global_mean = sum(slot_sum) / max(sum(slot_n), 1)
+    if global_mean <= 0:
+        return None
+
+    def factor(ts: float) -> float:
+        slot = int(ts // bar_s) % slots
+        mean = slot_sum[slot] / slot_n[slot] if slot_n[slot] else global_mean
+        f = mean / global_mean if global_mean else 1.0
+        return min(max(f, 0.1), 10.0)  # clamp: thin slots must not explode
+
+    adj = [float(c.get("volume", 0) or 0) / factor(c["timestamp"]) for c in hist]
+    base = adj[-49:-1]
+    mu = sum(base) / len(base)
+    sd = (sum((v - mu) ** 2 for v in base) / len(base)) ** 0.5
+    if sd <= max(mu, 1.0) * 1e-9:  # float noise, not real variance
+        return 0.0 if adj[-1] <= mu else 10.0
+    return round(min((adj[-1] - mu) / sd, 10.0), 2)
 
 
 def _ema(values: list[float], n: int) -> float:
@@ -120,6 +169,10 @@ def compute_market_features(
         # current bar volume vs its trailing 48-bar distribution;
         # |z| > 2 flags abnormal activity (real vs fake breakout confirmation)
         "volume_z_48bar": volume_z,
+        # time-of-day deseasonalized version (None until >= 4d of history);
+        # prefer this for breakout confirmation when available — the raw z
+        # misjudges quiet/busy hours (frontier notes §11)
+        "volume_z_deseason": _deseasonalized_volume_z(past, bar_minutes),
         "ema_fast_8bar": round(ema_fast, 2),
         "ema_slow_21bar": round(ema_slow, 2),
         "ema_cross": "BULL" if ema_fast > ema_slow else "BEAR",

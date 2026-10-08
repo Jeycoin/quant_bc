@@ -124,6 +124,7 @@ class SimPosition:
     sl_pct: float = POS_SL_PCT
     breakeven: bool = False   # move SL to entry after +1x SL favorable excursion
     trailing: bool = False    # after breakeven, trail 1x SL behind the extreme
+    time_stop_s: float = 0.0  # exit at market if be trigger not hit in time
     be_active: bool = False
     trail_best: float = 0.0   # best favorable price seen since activation
 
@@ -180,6 +181,12 @@ class SimPosition:
             exit_price, reason = tp, "TAKE_PROFIT"
         elif self.side == "SHORT" and low <= tp:
             exit_price, reason = tp, "TAKE_PROFIT"
+        elif self.time_stop_s and not self.be_active \
+                and ts - self.opened_ts >= self.time_stop_s:
+            # short-term time stop: a trade that has not reached +1x SL
+            # within the window never had momentum behind it — scratch it
+            # at market instead of donating fees/attention to a dead position
+            exit_price, reason = close, "TIME_STOP"
         elif ts >= self.deadline:
             exit_price, reason = close, "TIME_LIMIT"
         if exit_price is None and (self.breakeven or self.trailing):
@@ -322,6 +329,12 @@ async def main() -> None:
     parser.add_argument("--cooldown-hours", type=float, default=6.0,
                         help="after a STOP_LOSS/LIQUIDATION, block same-symbol "
                              "same-side entries for this many hours; 0 disables")
+    parser.add_argument("--time-stop-hours", type=float, default=6.0,
+                        help="short-term time stop: exit at market when a "
+                             "position has been open this long WITHOUT reaching "
+                             "its breakeven trigger (a trade that has not worked "
+                             "within a few hours is noise, not a thesis); "
+                             "0 disables, the 24h TIME_LIMIT stays as backstop")
     parser.add_argument("--min-confidence", type=float, default=MIN_CONFIDENCE)
     parser.add_argument("--grid-size", type=float, default=GRID_SIZE)
     parser.add_argument("--max-total-exposure", type=float, default=None,
@@ -408,6 +421,7 @@ async def main() -> None:
                  f"tp={args.tp_pct:g} sl={args.sl_pct:g} sl_atr_mult={args.sl_atr_mult:g} "
                  f"rr={args.rr:g} breakeven={not args.no_breakeven} "
                  f"trailing={not args.no_trailing} "
+                 f"time_stop_h={args.time_stop_hours:g} "
                  f"risk_per_trade={args.risk_per_trade_pct:g} "
                  f"cooldown_h={args.cooldown_hours:g} "
                  f"min_conf={args.min_confidence:g}")
@@ -595,7 +609,8 @@ async def main() -> None:
                             margin=margin, leverage=leverage,
                             tp_pct=tp_eff, sl_pct=sl_eff,
                             breakeven=not args.no_breakeven,
-                            trailing=not args.no_trailing))
+                            trailing=not args.no_trailing,
+                            time_stop_s=args.time_stop_hours * 3600))
                         cash -= margin
                         trade_count += 1
                 continue
@@ -679,7 +694,14 @@ async def main() -> None:
                     if cash < margin_eff:
                         risk_status, rejection_reason = "RISK_REJECTED", "insufficient cash"
                     else:
-                        cost = cost_validator.validate_position(notional_eff, tp_eff)
+                        # funding is charged when the position would pay it
+                        # over its intended holding window (never credited);
+                        # fr[sym] is the latest funding rate known at ts
+                        cost = cost_validator.validate_position(
+                            notional_eff, tp_eff,
+                            funding_rate=(fr.get(sym) if fr else None),
+                            expected_hold_hours=max(args.time_stop_hours, 1.0),
+                            side=action)
                         if not cost.approved:
                             risk_status, rejection_reason = "COST_REJECTED", cost.summary()
                         else:
@@ -700,7 +722,8 @@ async def main() -> None:
                                     margin=margin_eff, leverage=leverage,
                                     tp_pct=tp_eff, sl_pct=sl_eff,
                                     breakeven=not args.no_breakeven,
-                                    trailing=not args.no_trailing))
+                                    trailing=not args.no_trailing,
+                                    time_stop_s=args.time_stop_hours * 3600))
                                 cash -= margin_eff
                                 trade_count += 1
 
@@ -806,7 +829,8 @@ async def main() -> None:
                     margin=margin, leverage=leverage,
                     tp_pct=tp_b, sl_pct=sl_b,
                     breakeven=not args.no_breakeven,
-                    trailing=not args.no_trailing)
+                    trailing=not args.no_trailing,
+                    time_stop_s=args.time_stop_hours * 3600)
         if trend_pos is not None:
             sign = 1
             fees = (trend_pos.entry + last) * trend_pos.qty * FEE_RATE
@@ -835,6 +859,7 @@ async def main() -> None:
                          "sl_atr_mult": args.sl_atr_mult, "rr": args.rr,
                          "breakeven": not args.no_breakeven,
                          "trailing": not args.no_trailing,
+                         "time_stop_hours": args.time_stop_hours,
                          "risk_per_trade_pct": args.risk_per_trade_pct,
                          "cooldown_hours": args.cooldown_hours,
                          "min_confidence": args.min_confidence,

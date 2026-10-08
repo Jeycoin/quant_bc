@@ -272,10 +272,52 @@ class Glassnode(Provider):
         return {"signals": signals, "news": []}
 
 
+class HyperliquidDeriv(Provider):
+    """Derivatives positioning intelligence from the public Hyperliquid info
+    endpoint (metaAndAssetCtxs): open interest (USD notional) and current
+    funding rate per coin. No API key. This is the venue the deployment
+    already uses for market data, so coverage matches the watchlist exactly.
+
+    Why it matters (frontier notes §13): price + OI divergence separates new
+    money from short squeezes (price up + OI up = new longs; price up + OI
+    down = shorts covering), and cross-sectional funding ranks crowding.
+    """
+    name = "hyperliquid_deriv"
+
+    async def fetch(self, symbols: list[str]) -> dict[str, Any]:
+        signals = []
+        proxy = os.environ.get("MARKET_DATA_PROXY") or None
+        async with httpx.AsyncClient(timeout=_TIMEOUT, trust_env=False,
+                                     proxy=proxy) as client:
+            resp = await client.post("https://api.hyperliquid.xyz/info",
+                                     json={"type": "metaAndAssetCtxs"})
+            resp.raise_for_status()
+            meta, ctxs = resp.json()
+        names = [u.get("name") for u in meta.get("universe", [])]
+        now = time.time()
+        for coin, ctx in zip(names, ctxs):
+            if coin not in symbols:
+                continue
+            try:
+                mark = float(ctx.get("markPx", 0) or 0)
+                oi_usd = float(ctx.get("openInterest", 0) or 0) * mark
+                funding = float(ctx.get("funding", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            signals.append(IntelSignal(
+                kind="open_interest", symbol=coin, source=self.name,
+                value=oi_usd, confidence=0.9, relevance=0.9, ts=now))
+            signals.append(IntelSignal(
+                kind="funding_rate", symbol=coin, source=self.name,
+                value=funding, confidence=0.9, relevance=0.9, ts=now))
+        return {"signals": signals, "news": []}
+
+
 ALL_PROVIDERS: list[Provider] = [
     RssNews(),
     FearGreed(),
     BlockchainInfo(),
     LunarCrush(),
     Glassnode(),
+    HyperliquidDeriv(),
 ]

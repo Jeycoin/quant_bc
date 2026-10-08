@@ -43,11 +43,13 @@ class CostReport:
     safety_margin: float
     net_profit: float
     reason: str
+    funding_cost: float = 0.0
 
     def summary(self) -> str:
         return (
             f"gross={self.expected_gross:.4f} fees={self.entry_fee + self.exit_fee:.4f}"
             f" slippage={self.slippage_cost:.4f} margin={self.safety_margin:.4f}"
+            f" funding={self.funding_cost:.4f}"
             f" net={self.net_profit:.4f} -> {'APPROVED' if self.approved else 'REJECTED'}"
             f" ({self.reason})"
         )
@@ -61,11 +63,13 @@ class CostValidator:
     """
 
     def __init__(self, maker_fee: float, taker_fee: float,
-                 slippage_pct: float, safety_margin_pct: float):
+                 slippage_pct: float, safety_margin_pct: float,
+                 funding_interval_hours: float = 8.0):
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
         self.slippage_pct = slippage_pct
         self.safety_margin_pct = safety_margin_pct
+        self.funding_interval_hours = funding_interval_hours
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "CostValidator":
@@ -75,20 +79,48 @@ class CostValidator:
             taker_fee=float(c.get("taker_fee", 0.0005)),
             slippage_pct=float(c.get("slippage_pct", 0.0002)),
             safety_margin_pct=float(c.get("safety_margin_pct", 0.0003)),
+            funding_interval_hours=float(c.get("funding_interval_hours", 8.0)),
         )
 
+    def _funding_cost(self, notional_quote: float, funding_rate: float | None,
+                      expected_hold_hours: float | None, side: str | None) -> float:
+        """Expected funding payments over the holding period.
+
+        Perpetuals settle funding every `funding_interval_hours`: longs pay
+        when funding > 0, shorts pay when funding < 0. Conservative by
+        construction — funding INCOME (being on the receiving side) is never
+        credited, only payments are charged. Short-term holds that cross a
+        settlement timestamp pay real money; ignoring this made some past
+        replay trades look cheaper than they were (frontier notes §12).
+        """
+        if funding_rate is None or expected_hold_hours is None or not side:
+            return 0.0
+        if self.funding_interval_hours <= 0 or expected_hold_hours <= 0:
+            return 0.0
+        pays = (side.upper() == "LONG" and funding_rate > 0) or \
+               (side.upper() == "SHORT" and funding_rate < 0)
+        if not pays:
+            return 0.0
+        settlements = expected_hold_hours / self.funding_interval_hours
+        return notional_quote * abs(funding_rate) * settlements
+
     def validate(self, notional_quote: float, expected_gain_pct: float,
-                 maker_entry: bool, maker_exit: bool) -> CostReport:
+                 maker_entry: bool, maker_exit: bool,
+                 funding_rate: float | None = None,
+                 expected_hold_hours: float | None = None,
+                 side: str | None = None) -> CostReport:
         gross = notional_quote * expected_gain_pct
         entry_fee = notional_quote * (self.maker_fee if maker_entry else self.taker_fee)
         exit_fee = notional_quote * (self.maker_fee if maker_exit else self.taker_fee)
         slippage = notional_quote * self.slippage_pct
         margin = notional_quote * self.safety_margin_pct
-        net = gross - entry_fee - exit_fee - slippage - margin
+        funding = self._funding_cost(notional_quote, funding_rate,
+                                     expected_hold_hours, side)
+        net = gross - entry_fee - exit_fee - slippage - margin - funding
         reason = ("EXPECTED_NET_PROFIT_POSITIVE" if net > 0
                   else "EXPECTED_NET_PROFIT_NON_POSITIVE")
         return CostReport(net > 0, gross, entry_fee, exit_fee,
-                          slippage, margin, net, reason)
+                          slippage, margin, net, reason, funding)
 
     def validate_grid(self, total_amount_quote: float, take_profit_pct: float,
                       max_open_orders: int | None = None,
@@ -103,11 +135,18 @@ class CostValidator:
                              maker_entry, maker_exit)
 
     def validate_position(self, notional_quote: float,
-                          take_profit_pct: float) -> CostReport:
+                          take_profit_pct: float,
+                          funding_rate: float | None = None,
+                          expected_hold_hours: float | None = None,
+                          side: str | None = None) -> CostReport:
         """Directional position: entry and TP may both cross the spread, so
-        taker fees on both sides (conservative)."""
+        taker fees on both sides (conservative). Funding payments are
+        charged when funding_rate / expected_hold_hours / side are given."""
         return self.validate(notional_quote, take_profit_pct,
-                             maker_entry=False, maker_exit=False)
+                             maker_entry=False, maker_exit=False,
+                             funding_rate=funding_rate,
+                             expected_hold_hours=expected_hold_hours,
+                             side=side)
 
 
 # --------------------------------------------------------------------- risk
@@ -229,7 +268,11 @@ def validate_entry(features: dict[str, Any] | None,
             reasons.append(f"RSI {rsi} <= {rsi_os} — chasing exhaustion")
 
     if regime == "BREAKOUT":
-        volz = f.get("volume_z_48bar")
+        # prefer the time-of-day deseasonalized z when available: raw z
+        # misreads quiet-hour volume as abnormal (frontier notes §11)
+        volz = f.get("volume_z_deseason")
+        if volz is None:
+            volz = f.get("volume_z_48bar")
         if volz is None or abs(float(volz)) < volz_min:
             reasons.append(f"breakout without volume confirmation "
                            f"(volume_z={volz}, need >= {volz_min})")

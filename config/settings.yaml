@@ -34,6 +34,8 @@ cost:
   taker_fee: 0.0005        # market orders (position entry/exit)
   slippage_pct: 0.0002     # expected total slippage per round trip
   safety_margin_pct: 0.0003
+  funding_interval_hours: 8   # perpetual funding settlement cadence
+  expected_hold_hours: 8      # assumed position holding window for funding cost
 
 # Portfolio-level risk limits (agent/validators.py RiskValidator), evaluated
 # from actual account state — not from the LLM's self-report.

@@ -130,3 +130,33 @@ def test_position_margin_for_vol_targeting():
     # disabled -> fixed margin
     A.risk_per_trade_pct = 0.0
     assert position_margin_for(10_000, 0.02, A) == 2000.0
+
+
+def test_time_stop_scratches_stalled_position():
+    from scripts.backtest_agent import SimPosition
+    p = SimPosition("BTC", "LONG", 100.0, 1.0, deadline=1000 + 86400,
+                    opened_ts=1000, executor_id="t", regime_at_entry=None,
+                    margin=100.0, leverage=1.0, tp_pct=0.05, sl_pct=0.02,
+                    breakeven=True, trailing=True, time_stop_s=3600)
+    flat = {"high": 100.5, "low": 99.5, "close": 100.1}
+    # before the window: no exit
+    assert p.check_exit(flat, ts=1000 + 1800) is None
+    # after the window without breakeven activation: scratched at close
+    out = p.check_exit(flat, ts=1000 + 3600)
+    assert out is not None and out[1] == "TIME_STOP"
+
+
+def test_time_stop_does_not_kill_working_trade():
+    from scripts.backtest_agent import SimPosition
+    p = SimPosition("BTC", "LONG", 100.0, 1.0, deadline=1000 + 86400,
+                    opened_ts=1000, executor_id="t", regime_at_entry=None,
+                    margin=100.0, leverage=1.0, tp_pct=0.10, sl_pct=0.02,
+                    breakeven=True, trailing=True, time_stop_s=3600)
+    # +3% move activates breakeven (> +1x SL) before the window ends
+    p.check_exit({"high": 103.0, "low": 99.8, "close": 102.5}, ts=1000 + 600)
+    assert p.be_active
+    # past the time-stop window the working trade must NOT be scratched
+    # (low stays above the trailing stop at 103 - 2 = 101)
+    out = p.check_exit({"high": 102.8, "low": 101.5, "close": 102.0},
+                       ts=1000 + 7200)
+    assert out is None

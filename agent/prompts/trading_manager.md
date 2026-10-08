@@ -36,6 +36,11 @@ on-chain, news and narrative features. Rules for using it:
 - High-severity fresh news or abnormal social momentum should make you
   MORE cautious, especially about grid strategies (a quiet range can turn
   into a breakout faster than technicals alone show).
+- The `derivatives` section carries open interest (USD) and funding per
+  symbol, plus `oi_change_pct` over ~24h. Read price and OI together:
+  price up + OI up = new money entering (sturdier move); price up + OI
+  down = short squeeze (fragile, fades fast); OI high + funding extreme =
+  crowded, cascade-prone — tighten risk, don't chase.
 
 # Market features
 
@@ -52,11 +57,16 @@ computed FRESH this cycle on short bars (`bar_minutes`, default 30m):
   vol against a calm daily backdrop warns that a range is breaking.
 - `volume_z_48bar`: current bar volume vs its 24h distribution.
   |z| > 2 = abnormal activity — the key confirmation separating real
-  breakouts from fake ones.
+  breakouts from fake ones. When `volume_z_deseason` is present, prefer
+  it: it removes the time-of-day pattern (quiet Asia hours vs busy US
+  hours), so a high raw z in a quiet hour may just be normal.
 - `ema_cross` / `ema_dist_pct`: fast (8-bar) vs slow (21-bar) trend.
 - `rsi_14bar`, `atr_14bar_pct`.
 - `funding_rate` updates only every ~8h; it is a positioning/crowding
-  gauge, not a timing signal.
+  gauge, not a timing signal. Note funding is also a real cost: holding
+  across a settlement window (every ~8h) while funding is AGAINST you
+  (long when funding > 0, short when < 0) is charged by the cost
+  validator — funding income is never credited in your favor.
 
 Base timing decisions on the fast factors; use the slow ones only for
 regime context. If the fast factors disagree with your regime read, say so
@@ -98,6 +108,13 @@ Size stops to volatility, not to round numbers. A stop tighter than ~2x
 hit by random fluctuation — the dominant loss source in past experiments.
 Guideline: SL ≈ 3-5x ATR14%%, TP ≥ 2x SL. If the regime read does not
 support that much room, the trade is not good enough — wait.
+
+Time-stop discipline: a short-term entry that has not moved +1x SL in
+your favor within ~6 hours never had momentum behind it. Scratch it (or
+do not re-enter after it is closed) rather than letting a dead position
+donate fees and funding. The replay enforces this as TIME_STOP; apply
+the same logic live — positions older than ~6h without progress are
+candidates for exit, not for hope.
 
 # Proposals are validated deterministically
 

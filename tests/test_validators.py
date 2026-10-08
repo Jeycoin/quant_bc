@@ -156,3 +156,51 @@ def test_insufficient_data_is_not_exit():
     assert compute_grid_features(_ranging_candles(20)) == {}
     s = evaluate_grid_state({}, regime=None, config=CFG)
     assert s.state == GRID_NORMAL  # unknown features never fake an exit
+
+
+def test_funding_cost_rejects_marginal_long():
+    v = CostValidator(maker_fee=0.0002, taker_fee=0.0005,
+                      slippage_pct=0.0002, safety_margin_pct=0.0003)
+    # gross 0.25% clears fees+slippage+margin (0.15%) with room to spare
+    r_no_funding = v.validate_position(1000.0, 0.0025)
+    assert r_no_funding.approved
+    assert r_no_funding.funding_cost == 0.0
+    # one 8h settlement at +0.12% funding turns it negative
+    r = v.validate_position(1000.0, 0.0025, funding_rate=0.0012,
+                            expected_hold_hours=8.0, side="LONG")
+    assert r.funding_cost == 1.2
+    assert not r.approved
+    assert "funding=1.2000" in r.summary()
+
+
+def test_funding_income_never_credited():
+    v = CostValidator(maker_fee=0.0002, taker_fee=0.0005,
+                      slippage_pct=0.0002, safety_margin_pct=0.0003)
+    # short while funding > 0 would RECEIVE funding — must not help approval
+    r = v.validate_position(1000.0, 0.0012, funding_rate=0.001,
+                            expected_hold_hours=24.0, side="SHORT")
+    assert r.funding_cost == 0.0
+    assert not r.approved  # still rejected on fees alone
+
+
+def test_funding_charged_for_short_when_negative():
+    v = CostValidator(maker_fee=0.0002, taker_fee=0.0005,
+                      slippage_pct=0.0002, safety_margin_pct=0.0003)
+    r = v.validate_position(1000.0, 0.01, funding_rate=-0.0004,
+                            expected_hold_hours=16.0, side="SHORT")
+    assert r.funding_cost == 0.8  # 2 settlements * 0.04% * 1000
+    assert r.approved
+
+
+def test_entry_gate_breakout_prefers_deseason_volume():
+    from agent.validators import validate_entry
+    base = {"ema_cross": "BULL", "ret_16bar_pct": 1.5, "rsi_14bar": 50}
+    # raw z fails the threshold but the deseasonalized z confirms ->
+    # the gate must use the deseasonalized one
+    f = {**base, "volume_z_48bar": 0.3, "volume_z_deseason": 2.5}
+    assert validate_entry(f, "LONG", regime="BREAKOUT").approved
+    f2 = {**base, "volume_z_48bar": 3.0, "volume_z_deseason": 0.2}
+    assert not validate_entry(f2, "LONG", regime="BREAKOUT").approved
+    # fallback to raw z when deseason is unavailable
+    f3 = {**base, "volume_z_48bar": 2.0}
+    assert validate_entry(f3, "LONG", regime="BREAKOUT").approved

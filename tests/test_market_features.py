@@ -68,3 +68,34 @@ def test_bar_minutes_explicit_override():
 def test_min_bars_boundary():
     assert compute_market_features(_candles([100.0] * (MIN_BARS - 1))) is None
     assert compute_market_features(_candles([100.0] * MIN_BARS)) is not None
+
+
+def test_deseason_volume_none_on_short_history():
+    # 60 bars = 30h at 30m: far below the 4-day minimum -> None
+    f = compute_market_features(_candles([100.0] * 60))
+    assert f["volume_z_deseason"] is None
+
+
+def test_deseason_volume_corrects_time_of_day_bias():
+    # 8 days at 30m. Every day: volume 100 except a recurring 1000 spike at
+    # slot 10 (05:00 UTC). A same-slot spike is SEASONAL, not abnormal:
+    # the deseasonalized z must stay low even when the current bar is 1000.
+    bar_s = 1800
+    slots = 48
+    days = 8
+    volumes = []
+    for d in range(days):
+        for s in range(slots):
+            volumes.append(1000.0 if s == 10 else 100.0)
+    # align start to a bar boundary so slot(i) == i % 48 exactly
+    candles = _candles([100.0] * len(volumes), volumes,
+                       start_ts=1_700_006_400, bar_s=bar_s)
+    # end exactly on the seasonal spike slot
+    while int(candles[-1]["timestamp"] // bar_s) % slots != 10:
+        candles = candles[:-1]
+        volumes = volumes[:-1]
+    f = compute_market_features(candles)
+    assert f is not None
+    assert f["volume_z_48bar"] > 5          # raw z screams "abnormal"
+    assert f["volume_z_deseason"] is not None
+    assert abs(f["volume_z_deseason"]) < 2  # deseasonalized: just Tuesday

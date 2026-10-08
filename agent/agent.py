@@ -527,7 +527,7 @@ class TradingAgent:
                 "connector_name": os.getenv("MARKET_PROBE_CONNECTOR",
                                             "hyperliquid_perpetual"),
                 "trading_pair": f"{base}-USD",
-                "interval": bar, "max_records": 120,
+                "interval": bar, "max_records": 400,
             })
             rows = data.get("candles", data) if isinstance(data, dict) else data
             candles = []
@@ -610,8 +610,23 @@ class TradingAgent:
         price = await self._current_price(cfg)
         if not price:
             return None
+        # funding is a real holding cost for positions that cross a
+        # settlement window (every ~8h); charge it when we would pay,
+        # never credit it when we would receive (frontier notes §12)
+        side_map = {1: "LONG", 2: "SHORT", "1": "LONG", "2": "SHORT",
+                    "BUY": "LONG", "SELL": "SHORT", "LONG": "LONG",
+                    "SHORT": "SHORT", "buy": "LONG", "sell": "SHORT"}
+        side = side_map.get(cfg.get("side"))
+        base = str(cfg.get("trading_pair", "")).split("-")[0] or None
+        funding = None
+        if base:
+            funding = (await self._public_derivatives()).get(base, {}) \
+                .get("funding")
+        hold_h = float((self.guard.config.get("cost", {}) or {})
+                       .get("expected_hold_hours", 8.0))
         return self.cost_validator.validate_position(
-            float(amount) * price, float(tp)
+            float(amount) * price, float(tp),
+            funding_rate=funding, expected_hold_hours=hold_h, side=side,
         )
 
     async def _current_price(self, cfg: dict[str, Any]) -> float | None:
@@ -763,13 +778,14 @@ class TradingAgent:
                                                       ["BTC", "ETH"])
             symbols = [s for s in symbols if not s.startswith("U")]
             bar = os.getenv("FEATURE_BAR", "30m")
+            derivs = await self._public_derivatives()
             out: dict[str, Any] = {}
             for sym in symbols:
                 data = await self._hb_rest("POST", "/market-data/candles", {
                     "connector_name": os.getenv("MARKET_PROBE_CONNECTOR",
                                                 "hyperliquid_perpetual"),
                     "trading_pair": f"{sym}-USD",
-                    "interval": bar, "max_records": 120,
+                    "interval": bar, "max_records": 400,
                 })
                 rows = data.get("candles", data) if isinstance(data, dict) else data
                 candles = []
@@ -790,7 +806,9 @@ class TradingAgent:
                     # connector has collected live — fall back to the public
                     # API (read-only market data, same venue) for full depth
                     candles = await self._public_candles(sym, bar)
-                feats = compute_market_features(candles)
+                feats = compute_market_features(
+                    candles,
+                    funding_rate=(derivs.get(sym) or {}).get("funding"))
                 if feats:
                     out[sym] = feats
             return out or None
@@ -798,7 +816,10 @@ class TradingAgent:
             return None
 
     async def _public_candles(self, coin: str, interval: str,
-                              hours: int = 48) -> list[dict]:
+                              hours: int = 200) -> list[dict]:
+        """Public candle fallback. Default depth ~8 days so the intraday
+        deseasonalized volume baseline (market_features, needs >= 4 days)
+        works on the live path too."""
         import time as _time
 
         import httpx
@@ -821,6 +842,38 @@ class TradingAgent:
                  "high": float(c["h"]), "low": float(c["l"]),
                  "close": float(c["c"]), "volume": float(c["v"])}
                 for c in batch]
+
+    async def _public_derivatives(self) -> dict[str, dict[str, float]]:
+        """Per-coin {funding, open_interest_usd} from the public Hyperliquid
+        metaAndAssetCtxs endpoint (same venue as the market-data probe).
+        Returns {} on any failure — callers treat missing funding as None."""
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(
+                base_url="https://api.hyperliquid.xyz", timeout=15.0,
+                trust_env=False,
+                proxy=os.environ.get("MARKET_DATA_PROXY") or None,
+            ) as client:
+                resp = await client.post("/info", json={"type": "metaAndAssetCtxs"})
+                resp.raise_for_status()
+                meta, ctxs = resp.json()
+            out: dict[str, dict[str, float]] = {}
+            for name, ctx in zip(meta.get("universe", []), ctxs):
+                coin = name.get("name")
+                if not coin:
+                    continue
+                try:
+                    mark = float(ctx.get("markPx", 0) or 0)
+                    out[coin] = {
+                        "funding": float(ctx.get("funding", 0) or 0),
+                        "open_interest_usd": float(ctx.get("openInterest", 0) or 0) * mark,
+                    }
+                except (TypeError, ValueError):
+                    continue
+            return out
+        except Exception:
+            return {}
 
     async def _hb_rest(self, method: str, path: str, payload: dict[str, Any]) -> Any:
         import httpx

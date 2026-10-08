@@ -85,6 +85,45 @@ def build_onchain_features(store: IntelligenceStore,
     return out
 
 
+def build_derivatives_features(store: IntelligenceStore,
+                               symbols: list[str]) -> dict[str, Any]:
+    """Open interest + funding per symbol, with an OI trend read.
+
+    The OI change is computed against the observation ~24h ago (collector
+    runs every 15 min, so the store holds a dense series). Price/OI
+    divergence interpretation lives with the LLM — here we only ship the
+    numbers and their ages.
+    """
+    now = time.time()
+    signals = store.recent_signals(hours=48)
+    out: dict[str, Any] = {}
+    for symbol in symbols:
+        entry: dict[str, Any] = {}
+        for kind in ("open_interest", "funding_rate"):
+            s = _latest(signals, kind, symbol)
+            if s:
+                entry[kind] = {"value": s["value"],
+                               "age_minutes": _age(s["ts"], now)}
+        oi_series = [s for s in signals
+                     if s["kind"] == "open_interest" and s["symbol"] == symbol]
+        if len(oi_series) >= 2:
+            latest = oi_series[0]  # recent_signals returns newest first
+            ref = None
+            for s in oi_series[1:]:
+                if latest["ts"] - s["ts"] >= 23 * 3600:
+                    ref = s
+                    break
+            if ref is None:
+                ref = oi_series[-1]
+            if ref["value"]:
+                entry["oi_change_pct"] = round(
+                    (latest["value"] / ref["value"] - 1) * 100, 2)
+                entry["oi_change_window_h"] = round(
+                    (latest["ts"] - ref["ts"]) / 3600, 1)
+        out[symbol] = entry
+    return out
+
+
 def build_news_features(store: IntelligenceStore,
                         symbols: list[str]) -> dict[str, Any]:
     """News volume / severity per asset over 24h + the top recent events."""

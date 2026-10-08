@@ -30,6 +30,8 @@ SIGNAL_KINDS = {
     "active_addresses", "stablecoin_flow", "network_activity",
     # market-derived but intelligence-relevant
     "fear_greed",
+    # derivatives positioning (hyperliquid_deriv provider)
+    "open_interest", "funding_rate",
     # narrative engine output is stored separately (Narrative)
 }
 
@@ -99,6 +101,7 @@ class IntelSnapshot:
     generated_at: float = field(default_factory=time.time)
     social: dict[str, Any] = field(default_factory=dict)    # per symbol
     onchain: dict[str, Any] = field(default_factory=dict)   # per symbol
+    derivatives: dict[str, Any] = field(default_factory=dict)  # per symbol
     news: list[dict[str, Any]] = field(default_factory=list)  # recent events
     narratives: list[dict[str, Any]] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)  # provider health etc.
@@ -107,14 +110,15 @@ class IntelSnapshot:
         """Compact JSON-ready view with explicit data ages.
 
         INTEL_SECTIONS env (comma-separated subset of
-        social,onchain,news,narratives) enables information-ablation
-        experiments; unset = full intelligence.
+        social,onchain,derivatives,news,narratives) enables
+        information-ablation experiments; unset = full intelligence.
         """
         import os
 
         sections = os.getenv("INTEL_SECTIONS", "").strip()
         enabled = (set(s.strip() for s in sections.split(",") if s.strip())
-                   if sections else {"social", "onchain", "news", "narratives"})
+                   if sections else
+                   {"social", "onchain", "derivatives", "news", "narratives"})
         now = time.time()
 
         def with_age(item: dict[str, Any]) -> dict[str, Any]:
@@ -128,6 +132,7 @@ class IntelSnapshot:
             "generated_at": self.generated_at,
             "social": self.social if "social" in enabled else {},
             "onchain": self.onchain if "onchain" in enabled else {},
+            "derivatives": self.derivatives if "derivatives" in enabled else {},
             "news": ([with_age(n) for n in self.news[:max_news]]
                      if "news" in enabled else []),
             "narratives": ([with_age(n) for n in self.narratives[:max_narratives]]

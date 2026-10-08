@@ -232,3 +232,42 @@ Fee/Gross PnL,且必须**在相同样本上与基线对比**,单次结果不下�
 4. prompt 更新:横截面上下文 + 候选集约束
 5. Dashboard:Overview 增加横截面排名榜(只读展示)
 6. 实验 E1-E5
+
+---
+
+## 7. 修订 v0.6.1(2026-10-08):短线决策框架研究的反馈并入
+
+针对"短线交易决策框架"的外部研究(frontier notes §11-14)暴露了
+v0.5 实现与本设计的若干缺口,以下修订**已实现**(v0.5.1),先于
+L1-L3 横截面层落地,因为它们与多币种无关、且缺陷独立存在:
+
+### 7.1 已实现(v0.5.1,90/90 测试)
+
+| 修订 | 依据 | 实现 |
+|---|---|---|
+| 成交量 z 去日内季节化(同时段 7 天 profile) | frontier §11 | `market_features.volume_z_deseason`,BREAKOUT 门优先使用 |
+| Cost Validator 计入 funding 成本(只收不贷) | frontier §12 | `CostValidator._funding_cost` + settings 两项配置 |
+| 短线 time-stop 6h(未激活保本即离场) | frontier §14 | `SimPosition.time_stop_s` + `--time-stop-hours`,基线同规则 |
+| OI/funding 衍生品情报层 | frontier §13 | `HyperliquidDeriv` provider + snapshot `derivatives` 区 |
+| 实时特征历史加深(120→400 bars) | frontier §11 | `agent.py`(deseason 需要 ≥4 天) |
+
+### 7.2 对本文档(L1 排序层)的修订
+
+1. **L1 打分表新增衍生品维度**:`oi_change_pct`(横截面 z-score,
+   价涨+OI 增加分 / 价涨+OI 降扣分)与横截面 funding 拥挤度并列。
+   数据源已就绪(hyperliquid_deriv,与行情同源,五币全覆盖)。
+2. **BREAKOUT 量能确认以去季节化 z 为准**(§7.1 已落地,
+   L1 的 volume_z 因子同样应使用 `volume_z_deseason`)。
+3. **明确推迟:事件驱动风险升级**。30min 固定周期之外,理论上应有
+   波动冲击检测器(collector 每 15min 已跑,可加确定性检测写入
+   intel signal → grid protection external 输入)。推迟原因:
+   当前 collector 不取 K 线,新增采集路径需独立验证;且 GRID_EXIT
+   的客观特征(trend_strength/breakout)在 1h 尺度已能覆盖多数瀑布。
+   列入 v0.7 候选。
+4. **明确推迟:清算热力图**(Coinglass 需 API key,等实际需要时接入)。
+
+### 7.3 不变的判断
+
+- 横截面动量弱的结论不受 v0.5.1 影响:L1 仍只做多头侧排序。
+- time-stop 与 trailing 的组合强化而非改变 §2.1 的"多头腿集中"逻辑:
+  快速奖励有动量的仓位,快速释放没有动量的资金。
