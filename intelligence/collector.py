@@ -20,7 +20,7 @@ async def collect_once(
     symbols: list[str] | None = None,
 ) -> dict[str, Any]:
     """One collection round. Returns per-provider health for diagnostics."""
-    symbols = symbols or ["BTC", "ETH"]
+    symbols = symbols or ["BTC", "ETH", "SOL", "XRP", "SUI"]
     meta: dict[str, Any] = {"collected_at": time.time(), "providers": {}}
     for provider in ALL_PROVIDERS:
         if not provider.available():

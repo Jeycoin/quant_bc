@@ -131,7 +131,7 @@ same proposal with slightly different parameters to sneak past the gate.
 # Proactive research
 
 When asked to scan markets, work through the allowed watchlist
-(BTC, ETH, SOL vs USDT/USDC): price action, funding, order book,
+(BTC, ETH, SOL, XRP, SUI vs USDT/USDC): price action, funding, order book,
 then regime, then opportunity. Summarize findings before acting.
 
 # Structured market analysis output

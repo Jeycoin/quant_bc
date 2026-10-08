@@ -359,7 +359,8 @@ async def get_executor_detail(executor_id: str) -> dict[str, Any]:
     return detail
 
 
-MARKET_SYMBOLS = {"BTC": "BTC-USD", "ETH": "ETH-USD"}
+MARKET_SYMBOLS = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
+                  "XRP": "XRP-USD", "SUI": "SUI-USD"}
 MARKET_INTERVALS = {"1m", "5m", "15m", "1h"}
 
 
@@ -527,7 +528,7 @@ async def get_journal(limit: int = 100) -> dict[str, Any]:
 
 @app.get("/api/stream")
 async def stream_prices() -> StreamingResponse:
-    """SSE: BTC/ETH prices + funding every 5s. Pages still poll as fallback;
+    """SSE: watchlist prices + funding every 5s. Pages still poll as fallback;
     this endpoint is the seam for a future WebSocket upgrade."""
 
     async def generate():
@@ -536,7 +537,7 @@ async def stream_prices() -> StreamingResponse:
             try:
                 res = await hb.call("POST", "/market-data/prices", json={
                     "connector_name": MARKET_PROBE_CONNECTOR,
-                    "trading_pairs": ["BTC-USD", "ETH-USD"],
+                    "trading_pairs": list(MARKET_SYMBOLS.values()),
                 })
                 payload["prices"] = res.get("prices", {})
             except Exception as exc:

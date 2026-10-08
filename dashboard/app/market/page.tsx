@@ -12,9 +12,11 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
 const INTERVALS = ["1m", "5m", "15m", "1h"] as const;
+const SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SUI"] as const;
+type Symbol_ = (typeof SYMBOLS)[number];
 
 export default function MarketPage() {
-  const [symbol, setSymbol] = useState<"BTC" | "ETH">("BTC");
+  const [symbol, setSymbol] = useState<Symbol_>("BTC");
   const [interval, setInterval_] = useState<string>("1m");
 
   const market = useQuery({
@@ -32,10 +34,11 @@ export default function MarketPage() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <Tabs value={symbol} onValueChange={(v) => setSymbol(v as "BTC" | "ETH")}>
+        <Tabs value={symbol} onValueChange={(v) => setSymbol(v as Symbol_)}>
           <TabsList>
-            <TabsTrigger value="BTC">BTC</TabsTrigger>
-            <TabsTrigger value="ETH">ETH</TabsTrigger>
+            {SYMBOLS.map((s) => (
+              <TabsTrigger key={s} value={s}>{s}</TabsTrigger>
+            ))}
           </TabsList>
         </Tabs>
         <div className="flex gap-1">

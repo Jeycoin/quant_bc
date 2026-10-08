@@ -23,7 +23,7 @@ hb = ReadOnlyHummingbot()
 
 INTEL_DB = os.getenv("INTELLIGENCE_DB", "data/intelligence.db")
 ANALYTICS_DB = os.getenv("ANALYTICS_DB", "data/analytics.db")
-SYMBOLS = ["BTC", "ETH"]
+SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SUI"]
 
 
 def _intel_db_ok() -> bool:

@@ -67,9 +67,10 @@ export function AnalysisCard({ symbol }: { symbol: string }) {
 
 export function AiMarketView() {
   return (
-    <div className="grid gap-3 lg:grid-cols-2">
-      <AnalysisCard symbol="BTC" />
-      <AnalysisCard symbol="ETH" />
+    <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-3">
+      {["BTC", "ETH", "SOL", "XRP", "SUI"].map((s) => (
+        <AnalysisCard key={s} symbol={s} />
+      ))}
     </div>
   );
 }

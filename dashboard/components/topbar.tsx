@@ -68,8 +68,9 @@ export function Topbar() {
       <div className="flex items-center gap-4">
         {tick?.prices && (
           <div className="hidden items-center gap-3 font-mono text-xs text-muted-foreground sm:flex">
-            <span>BTC <span className="text-foreground">{tick.prices["BTC-USD"]?.toLocaleString()}</span></span>
-            <span>ETH <span className="text-foreground">{tick.prices["ETH-USD"]?.toLocaleString()}</span></span>
+            {["BTC", "ETH", "SOL", "XRP", "SUI"].map((s) => (
+              <span key={s}>{s} <span className="text-foreground">{tick.prices?.[`${s}-USD`]?.toLocaleString()}</span></span>
+            ))}
             <span className="relative flex h-1.5 w-1.5">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
               <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />

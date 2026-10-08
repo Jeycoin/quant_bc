@@ -11,7 +11,7 @@ safety:
   # Symbols the agent may analyze and trade.
   # Note: hyperliquid perp pairs are quoted in USD (BTC-USD), spot in USDC (UBTC-USDC).
   allowed_quote_assets: ["USDT", "USDC", "USD"]
-  allowed_base_assets: ["BTC", "UBTC", "ETH", "UETH", "SOL"]
+  allowed_base_assets: ["BTC", "UBTC", "ETH", "UETH", "SOL", "XRP", "SUI"]
 
   # Hard per-trade limits (quote currency).
   max_order_quote_amount: 500

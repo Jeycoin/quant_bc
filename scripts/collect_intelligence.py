@@ -23,7 +23,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from intelligence.collector import collect_once
 from intelligence.store import IntelligenceStore
 
-SYMBOLS = ["BTC", "ETH"]
+SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SUI"]
 
 
 async def main() -> None:

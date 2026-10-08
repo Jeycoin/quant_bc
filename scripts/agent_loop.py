@@ -32,7 +32,7 @@ from agent.safety import SafetyGuard
 
 SCAN_REQUEST = (
     "执行一次例行市场扫描与交易管理：\n"
-    "1) 用 get_market_data 获取 BTC 和 ETH 的价格、K线、资金费率；\n"
+    "1) 用 get_market_data 获取 BTC、ETH、SOL、XRP、SUI 的价格、K线、资金费率；\n"
     "2) 用 get_portfolio_overview 查看账户与持仓；\n"
     "3) 判断每个币种的 Market Regime 和是否存在交易机会；\n"
     "4) 若存在高置信度机会且风险允许，选择合适的已有策略创建执行器；"

@@ -68,7 +68,7 @@ from analytics.versioning import current_versions
 from backtest_grid import FEE_RATE, GridSim, fetch_candles
 from integrations.llm import create_llm_client
 
-SYMBOLS = ["BTC", "ETH"]
+SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SUI"]
 POSITION_SIZE = 200.0
 GRID_SIZE = 200.0
 GRID_TP = 0.002          # informed by the fee-floor backtest
