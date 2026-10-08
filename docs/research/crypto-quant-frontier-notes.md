@@ -89,3 +89,51 @@ evidence 中应被标注为弱证据。
 | 4 | 移动止损:+1×SL 后保本,+1.5×SL 后以 1×SL 跟踪 | §1 | `SimPosition` trailing |
 | 5 | 止损后同向冷静期 6h(回放) | §5 | 回放 entry gate 状态 |
 | 6 | prompt:多时间框架纪律 + 入场门规则透明化 | §1 | `trading_manager.md` |
+
+---
+
+# 多币种/横截面研究(2026-10,v0.6 设计依据)
+
+详细设计见 `multi-asset-framework-design.md`,此处只记研究结论。
+
+## 7. 时间序列动量强,横截面动量弱——只做多头侧
+
+来源:[Han/Kang/Ryu — TS & CS Momentum in Crypto under Realistic Assumptions](https://acfr.aut.ac.nz/__data/assets/pdf_file/0009/918729/Time_Series_and_Cross_Sectional_Momentum_in_the_Cryptocurrency_Market_with_IA.pdf)
+
+真实成本(15bps)+ 逐日盯市 + 清算风险下:
+- TS 动量强(28d lookback/5d holding,Sharpe 1.51 vs 市场 0.84),
+  优势来自下跌时防守(只在多头市场持仓)。
+- CS 动量弱:21 组合中 5 个清算,仅 6 个跑赢市场;最优 Sharpe 1.28 vs 1.01。
+- 动量利润集中在**多头腿 + 大市值币**;空头腿被反弹击穿;多空市场中性不可行。
+- 厚尾下平均收益 t 检验失效,必须看 log return 和实际盈亏。
+
+**含义**:横截面排序只用于"选谁做多",不做空弱者;做空门槛 > 做多;
+大市值 watchlist(BTC/ETH/SOL/XRP/SUI)正好是动量唯一显著的子集。
+
+## 8. 风险分配优于收益预测(组合层)
+
+来源:[arXiv 2412.02654 — Simple and Effective Portfolio Construction with Crypto Assets](https://arxiv.org/abs/2412.02654)
+
+- 约束风险分配(CRA)/风险平价:各仓位风险贡献均衡,**只需协方差估计**。
+- EWMA:波动率 63 天半衰期,相关 125 天;crypto 厚尾下标准方法足够。
+- 动态现金稀释达到目标风险。
+
+**含义**:组合层用等风险贡献 + 相关性折扣,叠加在 v0.5 波动率仓位上。
+
+## 9. 横截面资金费率
+
+来源:Presto(§3 同篇)
+
+- 单资产 funding 无择时力;**五币 funding 的相对排序**反映拥挤度差异。
+- 同组内 funding 显著偏高 = 多头拥挤 → 突破失败/回撤风险高。
+
+**含义**:funding 升级为横截面排序的降分因子,仍不做单币择时。
+
+## 10. 轮动 regime 的陷阱
+
+来源:[CoinAPI](https://www.coinapi.io/blog/what-altcoin-dominance-really-tells-you-and-how-to-trade-it)、[Gate](https://www.gate.com/blog/8968/btc-dominance-2025-impact-on-crypto-markets-and-altcoin-cycles)
+
+- BTC dominance 下降 ≠ 一定是 alt 季:也可能是"BTC 跌得更快"。
+- 轮动判断必须结合绝对方向,不能单独用相对强弱。
+
+**含义**:框架中 `rotation` 字段由相对分数差 + BTC 绝对方向联合判定。
