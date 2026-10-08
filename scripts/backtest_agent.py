@@ -67,6 +67,7 @@ from analytics.store import AnalyticsStore, new_decision_id
 from analytics.versioning import current_versions
 from backtest_grid import FEE_RATE, GridSim, fetch_candles
 from integrations.llm import create_llm_client
+from intelligence.cross_section import score_symbols
 
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SUI"]
 POSITION_SIZE = 200.0
@@ -336,6 +337,20 @@ async def main() -> None:
                              "within a few hours is noise, not a thesis); "
                              "0 disables, the 24h TIME_LIMIT stays as backstop")
     parser.add_argument("--min-confidence", type=float, default=MIN_CONFIDENCE)
+    parser.add_argument("--no-cross-section", dest="cross_section",
+                        action="store_false",
+                        help="disable the v0.6 cross-sectional ranking gate "
+                             "(control group for experiments)")
+    parser.set_defaults(cross_section=True)
+    parser.add_argument("--top-n", type=int, default=2,
+                        help="cross-section: max long candidates per cycle")
+    parser.add_argument("--min-dispersion", type=float, default=0.5,
+                        help="cross-section: below this score dispersion the "
+                             "market moves as one and no directional entries "
+                             "are allowed at all")
+    parser.add_argument("--same-dir-discount", type=float, default=0.5,
+                        help="portfolio layer: risk-budget multiplier per "
+                             "additional same-direction position")
     parser.add_argument("--grid-size", type=float, default=GRID_SIZE)
     parser.add_argument("--max-total-exposure", type=float, default=None,
                         help="override risk.max_total_exposure_quote for this run")
@@ -424,10 +439,13 @@ async def main() -> None:
                  f"time_stop_h={args.time_stop_hours:g} "
                  f"risk_per_trade={args.risk_per_trade_pct:g} "
                  f"cooldown_h={args.cooldown_hours:g} "
+                 f"xs={'on' if args.cross_section else 'off'}(top{args.top_n},"
+                 f"disp>={args.min_dispersion:g},samedir={args.same_dir_discount:g}) "
                  f"min_conf={args.min_confidence:g}")
     if exp_id is None:
         exp_id = store.start_experiment(
-            name=f"bt-replay-{args.days}d",
+            name=f"bt-replay-{args.days}d"
+                 + ("" if args.cross_section else "-noxs"),
             symbols=SYMBOLS,
             strategies=["grid", "position"],
             notes=f"historical forward-replay backtest; indicative only; "
@@ -450,8 +468,7 @@ async def main() -> None:
     cooldown_until: dict[tuple[str, str], float] = {}  # (symbol, side) -> ts
 
     timeline = [c["timestamp"] for c in candles["BTC"] if start_ts <= c["timestamp"] <= end_ts]
-    btc_by_ts = {c["timestamp"]: c for c in candles["BTC"]}
-    eth_by_ts = {c["timestamp"]: c for c in candles["ETH"]}
+    by_ts = {s: {c["timestamp"]: c for c in candles[s]} for s in SYMBOLS}
     boundary_printed = False
     decision_step = max(1, round(args.decision_minutes / args.bar_minutes))
     bph = max(1, 60 // args.bar_minutes)  # bars per hour: keeps grid-protection
@@ -461,7 +478,7 @@ async def main() -> None:
         prefix = resume_last_ts is not None and ts <= resume_last_ts
         # 1. advance simulations with this candle
         for pos in list(positions):
-            c = (btc_by_ts if pos.symbol == "BTC" else eth_by_ts).get(ts)
+            c = by_ts.get(pos.symbol, {}).get(ts)
             if not c:
                 continue
             result = pos.check_exit(c, ts)
@@ -481,12 +498,12 @@ async def main() -> None:
                         regime_at_entry=pos.regime_at_entry, source="agent",
                         experiment_id=exp_id)
         for sym, g in list(grids.items()):
-            c = (btc_by_ts if sym == "BTC" else eth_by_ts).get(ts)
+            c = by_ts.get(sym, {}).get(ts)
             if c:
                 g.sim.process_candle(c)
 
         # 2. equity snapshot
-        px = {s: float((btc_by_ts if s == "BTC" else eth_by_ts).get(ts, {}).get("close", 0) or 0)
+        px = {s: float(by_ts[s].get(ts, {}).get("close", 0) or 0)
               for s in SYMBOLS}
         pos_val = sum(
             p.margin
@@ -517,9 +534,21 @@ async def main() -> None:
                      for s in SYMBOLS}
         if any(v is None for v in summaries.values()):
             continue
+        # v0.6 L1: deterministic cross-sectional ranking over the watchlist.
+        # The LLM never ranks — it may only time entries inside the
+        # candidate sets this layer produces (design doc §3.1)
+        xs = None
+        if args.cross_section:
+            xs = score_symbols(summaries, top_n=args.top_n,
+                               min_dispersion=args.min_dispersion,
+                               funding=fr)
         context = {
             "current_time_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts)),
             "markets": summaries,
+            "cross_section": ({k: xs[k] for k in
+                               ("ranking", "scores", "dispersion", "rotation",
+                                "long_candidates", "short_candidates")}
+                              if xs else None),
             "portfolio": {
                 "cash": round(cash, 2),
                 "open_positions": [
@@ -545,7 +574,11 @@ async def main() -> None:
             user_msg = (
                 "Historical replay. Data as of the stated time:\n"
                 + json.dumps(context, ensure_ascii=False)
-                + "\nAnalyze both symbols and output one analysis block per symbol."
+                + f"\nAnalyze all {len(SYMBOLS)} symbols and output one "
+                  "analysis block per symbol. The cross_section block is a "
+                  "deterministic ranking you CANNOT override: you may only "
+                  "propose LONG for long_candidates and SHORT for "
+                  "short_candidates; every other symbol is WAIT/WATCH."
             )
             decision_id = new_decision_id()
             try:
@@ -673,12 +706,29 @@ async def main() -> None:
                     source="agent", experiment_id=exp_id)
             if action in ("LONG", "SHORT") and conf >= args.min_confidence \
                     and not any(p.symbol == sym for p in positions):
-                # 0. deterministic entry gate (framework v0.5): direction
+                # 0. cross-section gate (framework v0.6): LONG only for top-N
+                #    relative-strength candidates, SHORT only for the bottom
+                #    rank in a confirmed downtrend. Ranking is deterministic —
+                #    the LLM cannot talk its way past it.
+                xs_reject = None
+                if xs is not None:
+                    cands = xs["long_candidates"] if action == "LONG" \
+                        else xs["short_candidates"]
+                    if sym not in cands:
+                        rank = (xs["ranking"].index(sym) + 1
+                                if sym in xs["ranking"] else 0)
+                        xs_reject = (f"cross-section: {sym} rank {rank}/"
+                                     f"{len(xs['ranking'])} not in "
+                                     f"{'long' if action == 'LONG' else 'short'} "
+                                     f"candidates {cands} "
+                                     f"(dispersion {xs['dispersion']:.2f})")
+                # 1. deterministic entry gate (framework v0.5): direction
                 #    must align with 8h momentum / EMA cross / RSI / volume;
                 #    stop-out cooldown blocks re-entry into the same chop
-                gate = validate_entry(summaries[sym], action, regime,
-                                      config=settings)
-                if not gate.approved:
+                if xs_reject:
+                    risk_status, rejection_reason = "ENTRY_REJECTED", xs_reject
+                elif not (gate := validate_entry(summaries[sym], action, regime,
+                                                 config=settings)).approved:
                     risk_status = "ENTRY_REJECTED"
                     rejection_reason = "; ".join(gate.reasons)
                 elif ts < cooldown_until.get((sym, action), 0):
@@ -690,6 +740,16 @@ async def main() -> None:
                         summaries[sym].get("atr_14bar_pct"), args,
                         bar_seconds=args.bar_minutes * 60)
                     margin_eff = position_margin_for(equity, sl_eff, args)
+                    if xs is not None:
+                        # portfolio layer (v0.6 L3): same-direction positions
+                        # on correlated coins are ONE bet — each additional
+                        # one gets a discounted risk budget; the short side
+                        # gets half (long-leg concentration, frontier §7)
+                        k_same = sum(1 for p in positions if p.side == action)
+                        if k_same:
+                            margin_eff *= args.same_dir_discount ** k_same
+                        if action == "SHORT":
+                            margin_eff *= 0.5
                     notional_eff = margin_eff * leverage
                     if cash < margin_eff:
                         risk_status, rejection_reason = "RISK_REJECTED", "insufficient cash"
@@ -862,6 +922,10 @@ async def main() -> None:
                          "time_stop_hours": args.time_stop_hours,
                          "risk_per_trade_pct": args.risk_per_trade_pct,
                          "cooldown_hours": args.cooldown_hours,
+                         "cross_section": args.cross_section,
+                         "top_n": args.top_n,
+                         "min_dispersion": args.min_dispersion,
+                         "same_dir_discount": args.same_dir_discount,
                          "min_confidence": args.min_confidence,
                          "grid_size": args.grid_size,
                          "bar_minutes": args.bar_minutes,
