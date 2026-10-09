@@ -296,6 +296,13 @@ async def fetch_funding(coin: str, start_ms: int) -> dict[float, float]:
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Agent replay backtest")
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--end-ts", type=int, default=None,
+                        help="unix timestamp of the replay window end "
+                             "(default: now). Use to align an A/B run to the "
+                             "exact window of a baseline experiment")
+    parser.add_argument("--start-ts", type=int, default=None,
+                        help="unix timestamp of the replay window start "
+                             "(default: end-ts minus --days)")
     parser.add_argument("--bar-minutes", type=int, default=30,
                         help="candle bar size; LLM features are computed on these bars")
     parser.add_argument("--decision-minutes", type=int, default=30,
@@ -369,6 +376,9 @@ async def main() -> None:
 
     end_ts = int(time.time())
     start_ts = end_ts - args.days * 86400
+    if args.end_ts:
+        end_ts = args.end_ts
+        start_ts = args.start_ts or (end_ts - args.days * 86400)
 
     store = AnalyticsStore(str(REPO_ROOT / "data" / "analytics.db"))
     recorded_blocks: dict[float, list[dict]] = {}
