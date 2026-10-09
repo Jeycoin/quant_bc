@@ -281,6 +281,24 @@ def position_margin_for(equity: float, sl_pct: float, args) -> float:
     return args.position_margin
 
 
+def _rule_block(sym: str, s: dict) -> dict:
+    """Zero-intelligence proposer (--rule-proposer): pure EMA-cross +
+    24h-momentum alignment, fixed confidence, grid when ranging. Goes
+    through the exact same gates as LLM proposals — the null test for
+    whether the AI layer adds anything over rules."""
+    ema = s.get("ema_cross")
+    ret48 = s.get("ret_48bar_pct") or 0
+    if ema == "BULL" and ret48 > 0:
+        regime, action, strat = "TRENDING_BULL", "LONG", "position"
+    elif ema == "BEAR" and ret48 < 0:
+        regime, action, strat = "TRENDING_BEAR", "SHORT", "position"
+    else:
+        regime, action, strat = "RANGING", "WAIT", "grid"
+    return {"symbol": sym, "regime": regime, "action": action,
+            "confidence": 0.7, "strategy": strat,
+            "evidence": "rule: ema_cross + ret_48bar alignment"}
+
+
 async def fetch_funding(coin: str, start_ms: int) -> dict[float, float]:
     # trust_env=False: see fetch_candles in backtest_grid.py
     async with httpx.AsyncClient(base_url="https://api.hyperliquid.xyz",
@@ -317,6 +335,10 @@ async def main() -> None:
                              "re-run them through the CURRENT deterministic gates "
                              "(entry gate / cooldown / cost / risk). Isolates the "
                              "effect of gate changes from LLM behaviour")
+    parser.add_argument("--rule-proposer", action="store_true",
+                        help="zero-intelligence null test: replace the LLM with a "
+                             "pure EMA-cross + momentum rule proposer, same gates. "
+                             "If this matches LLM runs, the AI layer adds nothing")
     # risk-appetite knobs (replay only; live limits live in config/settings.yaml)
     parser.add_argument("--leverage", type=float, default=1.0,
                         help="position leverage; qty = margin * leverage / price")
@@ -448,7 +470,8 @@ async def main() -> None:
         print(f"  {sym}: {len(all_c)} candles, {len(funding[sym])} funding points")
 
     llm = create_llm_client()
-    model_label = (f"counterfactual:{args.counterfactual_exp}"
+    model_label = ("rule-proposer" if args.rule_proposer else
+                   f"counterfactual:{args.counterfactual_exp}"
                    if args.counterfactual_exp else llm.model)
     versions = current_versions()
     import yaml
@@ -479,6 +502,10 @@ async def main() -> None:
             exp_notes = (f"counterfactual replay: LLM decisions taken verbatim "
                          f"from {args.counterfactual_exp}, re-validated through "
                          f"current gates; no new LLM calls; {risk_note}")
+        elif args.rule_proposer:
+            exp_name = f"bt-replay-{args.days}d-rule"
+            exp_notes = (f"rule-proposer null test: EMA-cross + momentum rules "
+                         f"through the same gates, no LLM; {risk_note}")
         else:
             exp_name = (f"bt-replay-{args.days}d"
                         + ("" if args.cross_section else "-noxs"))
@@ -618,6 +645,12 @@ async def main() -> None:
             # source run's LLM proposals, verbatim — but from here on they go
             # through the live validation path (current gates), not the mirror
             blocks = recorded_blocks.get(float(ts), [])
+            decision_id = new_decision_id()
+        elif args.rule_proposer:
+            # zero-intelligence baseline: rule-based proposals through the SAME
+            # gates. If this matches the LLM runs, the AI layer's current
+            # marginal contribution over rules is zero — the honest null test.
+            blocks = [_rule_block(s, summaries[s]) for s in SYMBOLS]
             decision_id = new_decision_id()
         else:
             if resume_last_ts is not None and not boundary_printed:
