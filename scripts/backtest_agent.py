@@ -304,6 +304,12 @@ async def main() -> None:
                         help="resume an interrupted replay experiment: rebuild "
                              "portfolio state from its recorded decisions without "
                              "LLM calls, then continue live decisions up to now")
+    parser.add_argument("--counterfactual-exp", default=None,
+                        help="counterfactual replay: take a completed experiment's "
+                             "recorded LLM decisions as-is (no new LLM calls) and "
+                             "re-run them through the CURRENT deterministic gates "
+                             "(entry gate / cooldown / cost / risk). Isolates the "
+                             "effect of gate changes from LLM behaviour")
     # risk-appetite knobs (replay only; live limits live in config/settings.yaml)
     parser.add_argument("--leverage", type=float, default=1.0,
                         help="position leverage; qty = margin * leverage / price")
@@ -370,13 +376,14 @@ async def main() -> None:
     recorded_closes: dict[float, list[dict]] = {}
     resume_last_ts: float | None = None
     exp_id: str | None = None
-    if args.resume_exp:
-        exp = store.get_experiment(args.resume_exp)
+    if args.resume_exp or args.counterfactual_exp:
+        src_exp_id = args.resume_exp or args.counterfactual_exp
+        exp = store.get_experiment(src_exp_id)
         if not exp:
-            raise SystemExit(f"experiment {args.resume_exp} not found")
-        exp_id = args.resume_exp
-        events = store.list_decision_events(exp_id)
-        trades = store.list_trade_events(exp_id)
+            raise SystemExit(f"experiment {src_exp_id} not found")
+        exp_id = args.resume_exp  # counterfactual creates a NEW experiment below
+        events = store.list_decision_events(src_exp_id)
+        trades = store.list_trade_events(src_exp_id)
         if not events:
             raise SystemExit(f"experiment {exp_id} has no recorded decisions")
         block_events = [e for e in events if e.get("symbol")]
@@ -384,8 +391,13 @@ async def main() -> None:
             raise SystemExit(f"experiment {exp_id} has no recorded block decisions")
         # NO_BLOCK rows carry wall-clock ts, not candle ts — only block events
         # give reliable candle-aligned timestamps for the resume boundary
-        resume_last_ts = max(float(e["ts"]) for e in block_events)
+        resume_last_ts = max(float(e["ts"]) for e in block_events) \
+            if args.resume_exp else None
         start_ts = int(min(float(e["ts"]) for e in block_events))
+        if args.counterfactual_exp:
+            # replay exactly the source window — decisions outside the
+            # recorded timestamps never happened, so neither should the sim
+            end_ts = int(max(float(e["ts"]) for e in block_events))
         summary = json.loads(exp["summary_json"]) if exp.get("summary_json") else {}
         for e in events:
             if e.get("symbol"):
@@ -401,9 +413,16 @@ async def main() -> None:
             if t.get("ts_close") and t.get("close_type") != "REPLAY_END" \
                     and t.get("strategy") == "grid_executor":
                 recorded_closes.setdefault(float(t["ts_close"]), []).append(t)
-        print(f"resuming {exp_id}: {len(events)} recorded decisions up to "
-              f"{time.strftime('%m-%d %H:%M', time.gmtime(resume_last_ts))} UTC, "
-              f"window start {time.strftime('%m-%d %H:%M', time.gmtime(start_ts))} UTC")
+        if args.resume_exp:
+            print(f"resuming {exp_id}: {len(events)} recorded decisions up to "
+                  f"{time.strftime('%m-%d %H:%M', time.gmtime(resume_last_ts))} UTC, "
+                  f"window start {time.strftime('%m-%d %H:%M', time.gmtime(start_ts))} UTC")
+        else:
+            print(f"counterfactual from {src_exp_id}: {len(events)} recorded "
+                  f"decisions over "
+                  f"{time.strftime('%m-%d %H:%M', time.gmtime(start_ts))} -> "
+                  f"{time.strftime('%m-%d %H:%M', time.gmtime(end_ts))} UTC, "
+                  "re-validated through CURRENT gates, no LLM calls")
     warmup_ts = start_ts - 3 * 86400  # 3 extra days for context windows
     fetch_days = int((end_ts - start_ts) / 86400) + 4
 
@@ -419,6 +438,8 @@ async def main() -> None:
         print(f"  {sym}: {len(all_c)} candles, {len(funding[sym])} funding points")
 
     llm = create_llm_client()
+    model_label = (f"counterfactual:{args.counterfactual_exp}"
+                   if args.counterfactual_exp else llm.model)
     versions = current_versions()
     import yaml
     with open(REPO_ROOT / "config" / "settings.yaml", "r", encoding="utf-8") as fh:
@@ -443,13 +464,21 @@ async def main() -> None:
                  f"disp>={args.min_dispersion:g},samedir={args.same_dir_discount:g}) "
                  f"min_conf={args.min_confidence:g}")
     if exp_id is None:
+        if args.counterfactual_exp:
+            exp_name = f"bt-counterfactual-{args.counterfactual_exp}"
+            exp_notes = (f"counterfactual replay: LLM decisions taken verbatim "
+                         f"from {args.counterfactual_exp}, re-validated through "
+                         f"current gates; no new LLM calls; {risk_note}")
+        else:
+            exp_name = (f"bt-replay-{args.days}d"
+                        + ("" if args.cross_section else "-noxs"))
+            exp_notes = (f"historical forward-replay backtest; indicative only; "
+                         f"model={llm.model}; {risk_note}")
         exp_id = store.start_experiment(
-            name=f"bt-replay-{args.days}d"
-                 + ("" if args.cross_section else "-noxs"),
+            name=exp_name,
             symbols=SYMBOLS,
             strategies=["grid", "position"],
-            notes=f"historical forward-replay backtest; indicative only; "
-                  f"model={llm.model}; {risk_note}",
+            notes=exp_notes,
             status="backtest",  # never 'running' — the live agent loop tags
                                 # decisions with the active 'running' experiment
             **versions,
@@ -519,7 +548,11 @@ async def main() -> None:
         equity_curve.append({"ts": ts, "equity": equity})
 
         # 3. decision point
-        if prefix:
+        if args.counterfactual_exp:
+            # decisions happen exactly where the source run recorded them
+            if float(ts) not in recorded_blocks:
+                continue
+        elif prefix:
             # rebuild follows the recorded decision timestamps exactly — the
             # original run stepped by candle index, which drifts off the
             # decision phase when candles are missing, so index alignment
@@ -571,6 +604,11 @@ async def main() -> None:
                 if csym in grids:
                     g = grids.pop(csym)
                     cash += g.sim.equity(px.get(csym) or summaries[csym]["price"])
+        elif args.counterfactual_exp:
+            # source run's LLM proposals, verbatim — but from here on they go
+            # through the live validation path (current gates), not the mirror
+            blocks = recorded_blocks.get(float(ts), [])
+            decision_id = new_decision_id()
         else:
             if resume_last_ts is not None and not boundary_printed:
                 boundary_printed = True
@@ -803,7 +841,7 @@ async def main() -> None:
                 execution_id=execution_id, market_context=context["markets"].get(sym),
                 portfolio_context=context["portfolio"], experiment_id=exp_id,
                 rejection_reason=rejection_reason,
-                llm_model=llm.model,
+                llm_model=model_label,
                 **versions)
         if not prefix:
             print(f"  [{time.strftime('%m-%d %H:%M', time.gmtime(ts))}] "
@@ -940,6 +978,11 @@ async def main() -> None:
     if args.resume_exp:
         summary["resumed"] = True
         summary["resume_from_ts"] = resume_last_ts
+    if args.counterfactual_exp:
+        summary["counterfactual_from"] = args.counterfactual_exp
+        summary["counterfactual_note"] = (
+            "LLM decisions taken verbatim from the source experiment; "
+            "re-validated through the current deterministic gates")
     store.set_experiment_summary(exp_id, summary)
     store.end_experiment(exp_id)
     store.close()
