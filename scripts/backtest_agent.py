@@ -126,6 +126,7 @@ class SimPosition:
     breakeven: bool = False   # move SL to entry after +1x SL favorable excursion
     trailing: bool = False    # after breakeven, trail 1x SL behind the extreme
     time_stop_s: float = 0.0  # exit at market if be trigger not hit in time
+    time_stop_mode: str = "always"  # always | underwater | regime
     be_active: bool = False
     trail_best: float = 0.0   # best favorable price seen since activation
 
@@ -143,7 +144,30 @@ class SimPosition:
             return max(float(self.entry), self.trail_best - dist)
         return min(float(self.entry), self.trail_best + dist)
 
-    def check_exit(self, c: dict, ts: float) -> tuple[float, str, float] | None:
+    def _time_stop_allowed(self, close: float, current_regime: str | None) -> bool:
+        """Whether the short-term time stop may fire now.
+
+        "always": unconditional (legacy behaviour — scratches any position
+        that has not reached its breakeven trigger, winner or loser alike).
+        "underwater": only scratch positions that are actually losing; a
+        flat-to-green position has not disproven its thesis and scratching
+        it just donates fees (30d replay: 88 TIME_STOPs, -24.10 net).
+        "regime": underwater AND the entry thesis is dead — the latest
+        known regime no longer supports the position's direction.
+        """
+        if self.time_stop_mode == "always":
+            return True
+        sign = 1 if self.side == "LONG" else -1
+        if (close - self.entry) * sign >= 0:
+            return False
+        if self.time_stop_mode == "underwater":
+            return True
+        alive = {"LONG": {"TRENDING_BULL", "BREAKOUT", "HIGH_VOLATILITY"},
+                 "SHORT": {"TRENDING_BEAR", "HIGH_VOLATILITY"}}[self.side]
+        return (current_regime or "") not in alive
+
+    def check_exit(self, c: dict, ts: float,
+                   current_regime: str | None = None) -> tuple[float, str, float] | None:
         """Returns (net_pnl, reason, total_fees) or None.
 
         Includes liquidation: with leverage L the position is wiped out when
@@ -183,7 +207,8 @@ class SimPosition:
         elif self.side == "SHORT" and low <= tp:
             exit_price, reason = tp, "TAKE_PROFIT"
         elif self.time_stop_s and not self.be_active \
-                and ts - self.opened_ts >= self.time_stop_s:
+                and ts - self.opened_ts >= self.time_stop_s \
+                and self._time_stop_allowed(close, current_regime):
             # short-term time stop: a trade that has not reached +1x SL
             # within the window never had momentum behind it — scratch it
             # at market instead of donating fees/attention to a dead position
@@ -371,6 +396,15 @@ async def main() -> None:
                              "its breakeven trigger (a trade that has not worked "
                              "within a few hours is noise, not a thesis); "
                              "0 disables, the 24h TIME_LIMIT stays as backstop")
+    parser.add_argument("--time-stop-mode", choices=["always", "underwater", "regime"],
+                        default="underwater",
+                        help="underwater (default since v1.2, adopted per "
+                             "docs/experiments/2026-10-10-exit-logic-ab.md): only "
+                             "scratch losing positions; always: legacy "
+                             "unconditional time stop; regime: underwater AND "
+                             "latest regime no longer supports the position "
+                             "direction (exploratory, not yet validated "
+                             "out-of-window)")
     parser.add_argument("--min-confidence", type=float, default=MIN_CONFIDENCE)
     parser.add_argument("--no-cross-section", dest="cross_section",
                         action="store_false",
@@ -490,7 +524,7 @@ async def main() -> None:
                  f"tp={args.tp_pct:g} sl={args.sl_pct:g} sl_atr_mult={args.sl_atr_mult:g} "
                  f"rr={args.rr:g} breakeven={not args.no_breakeven} "
                  f"trailing={not args.no_trailing} "
-                 f"time_stop_h={args.time_stop_hours:g} "
+                 f"time_stop_h={args.time_stop_hours:g}/{args.time_stop_mode} "
                  f"risk_per_trade={args.risk_per_trade_pct:g} "
                  f"cooldown_h={args.cooldown_hours:g} "
                  f"xs={'on' if args.cross_section else 'off'}(top{args.top_n},"
@@ -521,6 +555,11 @@ async def main() -> None:
             **versions,
         )
     print(f"replay experiment: {exp_id} ({risk_note})")
+    # executor ids are namespaced per experiment: trade_events keys rows by
+    # executor_id alone, so un-namespaced ids let a later counterfactual run
+    # INSERT OR REPLACE over an earlier experiment's rows (observed 2026-10-10:
+    # exp-8a69cf61be6b's rows were clobbered by the exit-logic A/B reruns)
+    run_ns = f"@{exp_id}"
 
     system = (REPO_ROOT / "agent" / "prompts" / "trading_manager.md") \
         .read_text(encoding="utf-8").replace("{{MODE}}", "PAPER") + REPLAY_ADDENDUM
@@ -532,6 +571,7 @@ async def main() -> None:
     trade_count = 0
     consecutive_llm_errors = 0
     cooldown_until: dict[tuple[str, str], float] = {}  # (symbol, side) -> ts
+    latest_regime: dict[str, str] = {}  # symbol -> last classified regime
 
     timeline = [c["timestamp"] for c in candles["BTC"] if start_ts <= c["timestamp"] <= end_ts]
     by_ts = {s: {c["timestamp"]: c for c in candles[s]} for s in SYMBOLS}
@@ -547,7 +587,7 @@ async def main() -> None:
             c = by_ts.get(pos.symbol, {}).get(ts)
             if not c:
                 continue
-            result = pos.check_exit(c, ts)
+            result = pos.check_exit(c, ts, current_regime=latest_regime.get(pos.symbol))
             if result:
                 pnl, reason, fees = result
                 cash += pos.margin + pnl
@@ -700,6 +740,7 @@ async def main() -> None:
             if sym not in SYMBOLS:
                 continue
             regime = normalize_regime(block.get("regime"))
+            latest_regime[sym] = regime
             action = str(block.get("action") or "WAIT").upper()
             conf = float(block.get("confidence") or 0)
             price = px.get(sym) or summaries[sym]["price"]
@@ -730,7 +771,8 @@ async def main() -> None:
                             tp_pct=tp_eff, sl_pct=sl_eff,
                             breakeven=not args.no_breakeven,
                             trailing=not args.no_trailing,
-                            time_stop_s=args.time_stop_hours * 3600))
+                            time_stop_s=args.time_stop_hours * 3600,
+                            time_stop_mode=args.time_stop_mode))
                         cash -= margin
                         trade_count += 1
                 continue
@@ -769,7 +811,7 @@ async def main() -> None:
                 if rejection:
                     risk_status, rejection_reason = rejection
                 else:
-                    execution_id = f"bt-grid-{sym}-{int(ts)}"
+                    execution_id = f"bt-grid-{sym}-{int(ts)}{run_ns}"
                     grids[sym] = SimGrid(
                         GridSim(price * (1 - GRID_RANGE_PCT), price * (1 + GRID_RANGE_PCT),
                                 args.grid_size, tp=GRID_TP),
@@ -862,7 +904,7 @@ async def main() -> None:
                             if not risk.approved:
                                 risk_status, rejection_reason = "RISK_REJECTED", "; ".join(risk.reasons)
                             else:
-                                execution_id = f"bt-pos-{sym}-{int(ts)}"
+                                execution_id = f"bt-pos-{sym}-{int(ts)}{run_ns}"
                                 positions.append(SimPosition(
                                     sym, action, price, notional_eff / price,
                                     ts + POS_TIME_LIMIT_S, ts, execution_id, regime,
@@ -870,7 +912,8 @@ async def main() -> None:
                                     tp_pct=tp_eff, sl_pct=sl_eff,
                                     breakeven=not args.no_breakeven,
                                     trailing=not args.no_trailing,
-                                    time_stop_s=args.time_stop_hours * 3600))
+                                    time_stop_s=args.time_stop_hours * 3600,
+                                    time_stop_mode=args.time_stop_mode))
                                 cash -= margin_eff
                                 trade_count += 1
 
@@ -932,7 +975,7 @@ async def main() -> None:
         for c in window:
             base.process_candle(c)
         store.upsert_trade_event(
-            executor_id=f"bt-baseline-grid-{sym}", ts_open=start_ts, ts_close=last_ts,
+            executor_id=f"bt-baseline-grid-{sym}{run_ns}", ts_open=start_ts, ts_close=last_ts,
             symbol=sym, strategy="grid_executor", status="CLOSED",
             close_type="REPLAY_END", pnl_quote=base.equity(last) - args.grid_size,
             fees_quote=base.fees, source="baseline", experiment_id=exp_id)

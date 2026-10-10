@@ -160,3 +160,46 @@ def test_time_stop_does_not_kill_working_trade():
     out = p.check_exit({"high": 102.8, "low": 101.5, "close": 102.0},
                        ts=1000 + 7200)
     assert out is None
+
+
+def _ts_pos(mode: str) -> SimPosition:
+    return SimPosition("BTC", "LONG", 100.0, 1.0, deadline=1000 + 86400,
+                       opened_ts=1000, executor_id="t", regime_at_entry="TRENDING_BULL",
+                       margin=100.0, leverage=1.0, tp_pct=0.10, sl_pct=0.02,
+                       breakeven=True, trailing=True, time_stop_s=3600,
+                       time_stop_mode=mode)
+
+
+def test_time_stop_underwater_mode_keeps_green_position():
+    p = _ts_pos("underwater")
+    # past the window, slightly green, breakeven never activated
+    green = {"high": 100.6, "low": 99.8, "close": 100.4}
+    assert p.check_exit(green, ts=1000 + 3600) is None
+    # once underwater, the scratch fires
+    red = {"high": 99.9, "low": 99.0, "close": 99.5}
+    out = p.check_exit(red, ts=1000 + 5400)
+    assert out is not None and out[1] == "TIME_STOP"
+
+
+def test_time_stop_regime_mode_keeps_position_while_thesis_alive():
+    p = _ts_pos("regime")
+    red = {"high": 99.9, "low": 99.0, "close": 99.5}
+    # underwater but regime still confirms the LONG thesis: hold
+    assert p.check_exit(red, ts=1000 + 3600, current_regime="TRENDING_BULL") is None
+    # thesis dead (regime flipped/ranging) + underwater: scratch
+    out = p.check_exit(red, ts=1000 + 5400, current_regime="RANGING")
+    assert out is not None and out[1] == "TIME_STOP"
+
+
+def test_time_stop_regime_mode_unknown_regime_falls_back_to_scratch():
+    p = _ts_pos("regime")
+    red = {"high": 99.9, "low": 99.0, "close": 99.5}
+    out = p.check_exit(red, ts=1000 + 3600, current_regime=None)
+    assert out is not None and out[1] == "TIME_STOP"
+
+
+def test_time_stop_always_mode_unchanged():
+    p = _ts_pos("always")
+    green = {"high": 100.6, "low": 99.8, "close": 100.4}
+    out = p.check_exit(green, ts=1000 + 3600)
+    assert out is not None and out[1] == "TIME_STOP"
