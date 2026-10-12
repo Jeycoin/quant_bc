@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -206,6 +207,13 @@ class TradingAgent:
             user_message = (
                 user_message + "\n\n[intelligence]\n"
                 + json.dumps(self._intel_snapshot, ensure_ascii=False))
+        mem_ctx = await self._memory_context()
+        if mem_ctx:
+            user_message = (
+                user_message + "\n\n[memory] your own recent calls and closed "
+                "trades per symbol, plus lessons from past reviews — context "
+                "only, never a trade signal by itself\n"
+                + json.dumps(mem_ctx, ensure_ascii=False))
         portfolio_ctx = await self._snapshot_portfolio()
         messages = list(history or [])
         messages.append({"role": "user", "content": user_message})
@@ -805,6 +813,56 @@ class TradingAgent:
         except Exception:
             return None
 
+    async def _memory_context(self) -> dict[str, Any] | None:
+        """The agent's own recent track record, per symbol.
+
+        Memory is context only — it never overrides validators or safety
+        rules. Best-effort: any failure returns None (analytics path must
+        never block the trading loop).
+        """
+        try:
+            symbols = self.guard.config["safety"].get("allowed_base_assets",
+                                                      ["BTC", "ETH"])
+            symbols = [s for s in symbols if not s.startswith("U")]
+            now = time.time()
+            out: dict[str, Any] = {}
+            for sym in symbols:
+                entry: dict[str, Any] = {}
+                try:
+                    analyses = self.memory.latest_analysis(symbol=sym, limit=3)
+                except Exception:
+                    analyses = []
+                if analyses:
+                    entry["recent_calls"] = [
+                        {
+                            "age_min": round((now - a["ts"]) / 60),
+                            "regime": a["regime"],
+                            "action": a["action"],
+                            "conf": a["confidence"],
+                            "evidence": (a["evidence"] or "")[:120],
+                        }
+                        for a in analyses
+                    ]
+                if self.analytics is not None:
+                    try:
+                        trades = self.analytics.recent_trades(sym, limit=4)
+                    except Exception:
+                        trades = []
+                    if trades:
+                        entry["recent_trades"] = trades
+                if entry:
+                    out[sym] = entry
+            if self.analytics is not None:
+                try:
+                    lessons = self.analytics.recent_lessons(limit=3)
+                except Exception:
+                    lessons = []
+                if lessons:
+                    out["lessons"] = lessons
+            return out or None
+        except Exception:
+            return None
+
     async def _market_features_context(self) -> dict[str, Any] | None:
         """Fresh multi-horizon market features per symbol (short bars).
 
@@ -851,6 +909,16 @@ class TradingAgent:
                     candles,
                     funding_rate=(derivs.get(sym) or {}).get("funding"))
                 if feats:
+                    # compact price shape: % change vs first point of the
+                    # window, so the LLM sees the actual path, not just
+                    # aggregate features (absolute level is in `price`)
+                    window = candles[-24:]
+                    base = window[0]["close"] if window else 0
+                    if base:
+                        feats["path_pct"] = [
+                            round((c["close"] / base - 1) * 100, 2) for c in window
+                        ]
+                        feats["path_bars"] = len(window)
                     out[sym] = feats
             return out or None
         except Exception:

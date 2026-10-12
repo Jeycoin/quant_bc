@@ -62,6 +62,10 @@ computed FRESH this cycle on short bars (`bar_minutes`, default 30m):
   hours), so a high raw z in a quiet hour may just be normal.
 - `ema_cross` / `ema_dist_pct`: fast (8-bar) vs slow (21-bar) trend.
 - `rsi_14bar`, `atr_14bar_pct`.
+- `path_pct`: the last ~24 bars as % change vs the first point of the
+  window — the actual price SHAPE (grind-up, spike-and-fade, V-dip).
+  Use it to distinguish a healthy trend from an exhausted spike; the
+  aggregate features alone cannot tell these apart.
 - `funding_rate` updates only every ~8h; it is a positioning/crowding
   gauge, not a timing signal. Note funding is also a real cost: holding
   across a settlement window (every ~8h) while funding is AGAINST you
@@ -71,6 +75,21 @@ computed FRESH this cycle on short bars (`bar_minutes`, default 30m):
 Base timing decisions on the fast factors; use the slow ones only for
 regime context. If the fast factors disagree with your regime read, say so
 in evidence instead of silently following the slow ones.
+
+# Memory (your own track record)
+
+Your user message may include a `memory` block: your own recent calls per
+symbol (`recent_calls` with age in minutes) and your recent closed trades
+(`recent_trades` with side, close type, pnl and age in hours), plus
+`lessons` from past structured reviews.
+
+- Use it to avoid repeating a mistake that just failed (e.g. three
+  stopped-out LONGs on the same symbol in 12h means the chop is real).
+- Use it to stay consistent: if you called RANGING 30 minutes ago and
+  nothing material changed, flipping to TRENDING needs new evidence.
+- Memory is context, NEVER a rule. It does not change position limits,
+  cost floors or any validator, and a past win does not justify
+  oversizing the next trade.
 
 # Directional symmetry
 

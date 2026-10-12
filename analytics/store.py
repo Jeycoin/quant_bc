@@ -198,6 +198,36 @@ class AnalyticsStore:
         self._conn.row_factory = None
         return dict(row) if row else None
 
+    def recent_trades(self, symbol: str, limit: int = 4) -> list[dict[str, Any]]:
+        """Most recent closed trades for a symbol, compact shape for LLM
+        context (the agent's own track record)."""
+        rows = self._conn.execute(
+            "SELECT side, close_type, pnl_quote, ts_close FROM trade_events"
+            " WHERE symbol = ? AND status = 'CLOSED' AND ts_close IS NOT NULL"
+            " ORDER BY ts_close DESC LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
+        now = time.time()
+        return [
+            {
+                "side": r[0],
+                "close": r[1],
+                "pnl": round(r[2], 2) if r[2] is not None else None,
+                "age_h": round((now - r[3]) / 3600, 1),
+            }
+            for r in rows
+        ]
+
+    def recent_lessons(self, limit: int = 3) -> list[str]:
+        """Latest structured review lessons (context for future decisions)."""
+        rows = self._conn.execute(
+            "SELECT lesson FROM review_events"
+            " WHERE lesson IS NOT NULL AND lesson != ''"
+            " ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [r[0][:200] for r in rows]
+
     # ---------------------------------------------------------------- trades
 
     def upsert_trade_event(
