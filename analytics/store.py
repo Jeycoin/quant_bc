@@ -110,6 +110,9 @@ class AnalyticsStore:
     def __init__(self, db_path: str = "data/analytics.db"):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path)
+        # the live agent loop and backtest replays write the same DB;
+        # wait for the writer lock instead of failing instantly
+        self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(_SCHEMA)
         self._migrate()
 

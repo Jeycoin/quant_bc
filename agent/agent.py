@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shlex
@@ -45,6 +46,8 @@ from integrations.llm import create_llm_client
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "trading_manager.md"
 MAX_TOOL_ROUNDS = 25
+
+log = logging.getLogger("agent")
 
 _ANALYSIS_BLOCK = re.compile(r"```analysis\s*(\{.*?\})\s*```", re.DOTALL)
 _REVIEW_BLOCK = re.compile(r"```review\s*(\{.*?\})\s*```", re.DOTALL)
@@ -296,7 +299,8 @@ class TradingAgent:
             return {}
 
     def _record_decision_events(
-        self, decision_id: str, answer: str, portfolio_ctx: dict[str, Any]
+        self, decision_id: str, answer: str, portfolio_ctx: dict[str, Any],
+        _retried: bool = False,
     ) -> None:
         """Persist structured decision events (analytics path, best-effort)."""
         if self.analytics is None:
@@ -347,7 +351,27 @@ class TradingAgent:
                     **common,
                 )
         except Exception:
-            pass  # analytics must never break the trading path
+            # a long-running loop can hold a poisoned SQLite connection
+            # (e.g. a failed commit during a concurrent backtest write);
+            # never fail silently — log, reconnect once, retry once
+            log.exception("analytics decision-event record failed")
+            if _retried:
+                return
+            try:
+                self.analytics.close()
+            except Exception:
+                pass
+            try:
+                self.analytics = AnalyticsStore(
+                    os.getenv("ANALYTICS_DB", "data/analytics.db")
+                )
+            except Exception:
+                self.analytics = None
+                log.exception("analytics reconnect failed; recording disabled")
+                return
+            self._record_decision_events(
+                decision_id, answer, portfolio_ctx, _retried=True
+            )
 
     async def _tool_loop(
         self,
@@ -382,6 +406,17 @@ class TradingAgent:
     async def _call_tool(
         self, session: ClientSession, name: str, arguments: dict[str, Any]
     ) -> str:
+        # some providers (observed with glm-4.5-air) occasionally emit the
+        # tool input as a raw JSON string instead of a parsed object —
+        # coerce it; if it is not an object at all, hand the error back to
+        # the model instead of crashing the whole decision cycle
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                return f"TOOL INPUT ERROR: arguments must be a JSON object, got: {arguments[:200]}"
+        if not isinstance(arguments, dict):
+            return f"TOOL INPUT ERROR: arguments must be a JSON object, got {type(arguments).__name__}"
         try:
             self.guard.check_tool_call(name, arguments)
             await self._check_position_capacity(name, arguments)
