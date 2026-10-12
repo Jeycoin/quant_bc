@@ -101,14 +101,104 @@ def _atr_pct(candles: list[dict], n: int = 14) -> float:
     return (sum(trs) / n) / price * 100 if price else 0.0
 
 
+def _adx(candles: list[dict], n: int = 14) -> float | None:
+    """Average Directional Index — trend STRENGTH (0-100), direction-free.
+
+    < 20 = chop / no trend, 20-25 = emerging, > 25 = trending. The single
+    most important factor for the grid-vs-trend strategy choice.
+    """
+    if len(candles) < 2 * n + 2:
+        return None
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(candles)):
+        h, ph = float(candles[i]["high"]), float(candles[i - 1]["high"])
+        lo, plo = float(candles[i]["low"]), float(candles[i - 1]["low"])
+        pc = float(candles[i - 1]["close"])
+        up, dn = h - ph, plo - lo
+        plus_dm.append(up if up > dn and up > 0 else 0.0)
+        minus_dm.append(dn if dn > up and dn > 0 else 0.0)
+        trs.append(max(h - lo, abs(h - pc), abs(lo - pc)))
+
+    def smooth(xs: list[float]) -> list[float]:
+        out = [sum(xs[:n])]
+        for x in xs[n:]:
+            out.append(out[-1] - out[-1] / n + x)
+        return out
+
+    tr_s, p_s, m_s = smooth(trs), smooth(plus_dm), smooth(minus_dm)
+    dxs = []
+    for t, p, m in zip(tr_s, p_s, m_s):
+        if t <= 0:
+            continue
+        pdi, mdi = 100 * p / t, 100 * m / t
+        dxs.append(100 * abs(pdi - mdi) / (pdi + mdi) if pdi + mdi > 0 else 0.0)
+    if len(dxs) < n:
+        return None
+    return round(sum(dxs[-n:]) / n, 1)
+
+
+def _streak(closes: list[float]) -> int:
+    """Consecutive up (+) or down (-) bars at the tail. |streak| >= 4 at
+    30m bars is exhaustion territory for mean-reversion, fuel for momentum."""
+    s = 0
+    for i in range(len(closes) - 1, 0, -1):
+        d = closes[i] - closes[i - 1]
+        if d == 0:
+            break
+        sign = 1 if d > 0 else -1
+        if s == 0:
+            s = sign
+        elif (s > 0) != (sign > 0):
+            break
+        else:
+            s += sign
+    return s
+
+
+def _vwap_dist_pct(candles: list[dict], n: int = 48) -> float | None:
+    """Distance from the trailing n-bar VWAP — the intraday fair-value
+    anchor. Price stretched > ~1.5x ATR above VWAP = poor chase entry."""
+    w = candles[-n:]
+    pv = sum(float(c["close"]) * float(c.get("volume", 0) or 0) for c in w)
+    vv = sum(float(c.get("volume", 0) or 0) for c in w)
+    if vv <= 0:
+        return None
+    vwap = pv / vv
+    price = float(candles[-1]["close"])
+    return round((price / vwap - 1) * 100, 3) if vwap else None
+
+
+def _corr(a: list[float], b: list[float]) -> float | None:
+    n = min(len(a), len(b))
+    if n < 10:
+        return None
+    ra = [(a[i] / a[i - 1] - 1) for i in range(-n + 1, 0) if a[i - 1]]
+    rb = [(b[i] / b[i - 1] - 1) for i in range(-n + 1, 0) if b[i - 1]]
+    m = min(len(ra), len(rb))
+    if m < 10:
+        return None
+    ra, rb = ra[-m:], rb[-m:]
+    ma, mb = sum(ra) / m, sum(rb) / m
+    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    va = sum((x - ma) ** 2 for x in ra)
+    vb = sum((y - mb) ** 2 for y in rb)
+    if va <= 0 or vb <= 0:
+        return None
+    return round(cov / (va * vb) ** 0.5, 2)
+
+
 def compute_market_features(
     candles: list[dict],
     upto_ts: float | None = None,
     funding_rate: float | None = None,
     bar_minutes: int | None = None,
+    ref_candles: list[dict] | None = None,
 ) -> dict[str, Any] | None:
     """Multi-horizon features from ascending {timestamp, open, high, low,
-    close, volume} candles. Returns None when history is insufficient."""
+    close, volume} candles. Returns None when history is insufficient.
+
+    ref_candles: benchmark (BTC) candles for cross-asset factors
+    (correlation, relative strength, beta). Ignored for BTC itself."""
     past = [c for c in candles if upto_ts is None or c["timestamp"] <= upto_ts]
     if len(past) < MIN_BARS:
         return None
@@ -150,8 +240,69 @@ def compute_market_features(
 
     ema_fast = _ema(closes[-32:], 8)
     ema_slow = _ema(closes, 21)
+    ema50 = _ema(closes[-96:], 50) if len(closes) >= 60 else None
 
-    return {
+    # MACD (12/26/9) histogram — momentum acceleration, in % of price
+    macd_hist_pct = None
+    if len(closes) >= 40:
+        dif = _ema(closes, 12) - _ema(closes, 26)
+        # DEA: 9-bar EMA of DIF over the trailing window
+        difs = []
+        for i in range(30, len(closes) + 1):
+            w = closes[:i]
+            difs.append(_ema(w, 12) - _ema(w, 26))
+        dea = _ema(difs[-12:], 9)
+        macd_hist_pct = round((dif - dea) / price * 100, 3) if price else None
+
+    # Kaufman efficiency ratio over 16 bars: |net move| / path length.
+    # ~1 = clean trend, ~0 = pure chop. The grid-vs-trend switch.
+    er_16bar = None
+    if len(closes) >= 17:
+        path = sum(abs(closes[i] - closes[i - 1]) for i in range(-16, 0))
+        net = abs(closes[-1] - closes[-17])
+        er_16bar = round(net / path, 2) if path > 0 else None
+
+    # Bollinger width (20-bar, 2sd) — squeeze detection
+    bb_width_pct = None
+    if len(closes) >= 20:
+        w20 = closes[-20:]
+        mu20 = sum(w20) / 20
+        sd20 = (sum((v - mu20) ** 2 for v in w20) / 20) ** 0.5
+        bb_width_pct = round(4 * sd20 / mu20 * 100, 3) if mu20 else None
+
+    # ATR percentile vs its own trailing history (vol regime, not level)
+    atr_pct_now = _atr_pct(past)
+    atr_pctile = None
+    if len(past) >= 64:
+        atr_hist = [
+            _atr_pct(past[:i]) for i in range(len(past) - 48, len(past) + 1)
+        ]
+        atr_hist = [a for a in atr_hist if a is not None]
+        if atr_hist:
+            below = sum(1 for a in atr_hist if a <= atr_pct_now)
+            atr_pctile = round(below / len(atr_hist), 2)
+
+    # up-bar volume share over 8 bars: 0.5 = balanced; > 0.65 = buyers
+    # dominating volume (conviction), < 0.35 = distribution
+    up_vol_share_8bar = None
+    w8 = past[-8:]
+    up_v = sum(float(c.get("volume", 0) or 0)
+               for c in w8 if float(c["close"]) >= float(c["open"]))
+    tot_v = sum(float(c.get("volume", 0) or 0) for c in w8)
+    if tot_v > 0:
+        up_vol_share_8bar = round(up_v / tot_v, 2)
+
+    # bars since the 48-bar high — trend freshness (0 = making highs now)
+    bars_since_high = 0
+    for i in range(len(past) - 1, max(len(past) - 49, -1), -1):
+        if float(past[i]["high"]) >= hi48 - 1e-12:
+            bars_since_high = len(past) - 1 - i
+            break
+
+    # distance below the 24h range high (%): how much room to the ceiling
+    dist_from_high_pct = round((price / hi48 - 1) * 100, 3) if hi48 else None
+
+    out: dict[str, Any] = {
         "bar_minutes": bar_minutes,
         "asof_ts": past[-1]["timestamp"],
         "price": price,
@@ -177,8 +328,38 @@ def compute_market_features(
         "ema_slow_21bar": round(ema_slow, 2),
         "ema_cross": "BULL" if ema_fast > ema_slow else "BEAR",
         "ema_dist_pct": round((ema_fast / ema_slow - 1) * 100, 3),
+        "ema50_dist_pct": (
+            round((price / ema50 - 1) * 100, 3) if ema50 else None),
+        "adx_14bar": _adx(past),
+        "macd_hist_pct": macd_hist_pct,
+        "efficiency_ratio_16bar": er_16bar,
+        "bb_width_pct": bb_width_pct,
+        "atr_pctile_48bar": atr_pctile,
+        "streak_bars": _streak(closes),
+        "up_vol_share_8bar": up_vol_share_8bar,
+        "vwap_dist_48bar_pct": _vwap_dist_pct(past),
+        "bars_since_48bar_high": bars_since_high,
+        "dist_from_48bar_high_pct": dist_from_high_pct,
         "rsi_14bar": round(_rsi(closes), 1),
-        "atr_14bar_pct": round(_atr_pct(past), 3),
+        "rsi_slope_4bar": (
+            round(_rsi(closes) - _rsi(closes[:-4]), 1)
+            if len(closes) >= 19 else None),
+        "atr_14bar_pct": round(atr_pct_now, 3),
         # slow field: funding updates only every ~8h
         "funding_rate": funding_rate,
     }
+
+    # cross-asset factors vs the benchmark (BTC): alt moves are mostly
+    # beta to BTC — the LLM needs to know whether THIS symbol is leading
+    # or just following
+    if ref_candles:
+        ref_past = [c for c in ref_candles
+                    if upto_ts is None or c["timestamp"] <= upto_ts]
+        ref_closes = [float(c["close"]) for c in ref_past]
+        if len(ref_closes) >= 50:
+            out["corr_btc_48bar"] = _corr(closes[-49:], ref_closes[-49:])
+            if len(closes) >= 17 and len(ref_closes) >= 17:
+                rs = (closes[-1] / closes[-17] - 1) - (
+                    ref_closes[-1] / ref_closes[-17] - 1)
+                out["rs_vs_btc_8h_pct"] = round(rs * 100, 2)
+    return out

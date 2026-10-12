@@ -61,6 +61,31 @@ computed FRESH this cycle on short bars (`bar_minutes`, default 30m):
   it: it removes the time-of-day pattern (quiet Asia hours vs busy US
   hours), so a high raw z in a quiet hour may just be normal.
 - `ema_cross` / `ema_dist_pct`: fast (8-bar) vs slow (21-bar) trend.
+  `ema50_dist_pct`: price vs the slow EMA50 — the higher-timeframe bias.
+- `adx_14bar`: trend STRENGTH 0-100, direction-free. <20 = chop,
+  20-25 = emerging, >25 = trending. The grid-vs-trend switch: grids want
+  low ADX, directional entries want rising ADX with direction.
+- `efficiency_ratio_16bar`: |net move| / path length. ~1 = clean trend,
+  ~0 = pure chop. Confirms or contradicts the ADX read.
+- `macd_hist_pct`: momentum acceleration; sign flips precede crossovers.
+- `bb_width_pct`: Bollinger width — a squeeze (very low width) often
+  precedes expansion; do not widen grids into a squeeze.
+- `atr_pctile_48bar`: current ATR vs its own trailing distribution —
+  vol REGIME (0-1), independent of absolute level.
+- `streak_bars`: consecutive up/down bars. |streak| >= 4 at 30m bars is
+  exhaustion territory for mean-reversion, fuel for momentum.
+- `up_vol_share_8bar`: share of volume on up-bars. >0.65 = buyers
+  dominating with conviction, <0.35 = distribution.
+- `vwap_dist_48bar_pct`: distance from the 24h VWAP (intraday fair
+  value). Stretched far above VWAP = poor chase entry for LONGs.
+- `bars_since_48bar_high` / `dist_from_48bar_high_pct`: trend freshness
+  and room to the ceiling.
+- `rsi_slope_4bar`: RSI now vs 4 bars ago — momentum direction, not
+  just level.
+- `corr_btc_48bar` / `rs_vs_btc_8h_pct` (alts only): correlation to BTC
+  and relative strength over 8h. Most alt moves are BTC beta — a
+  positive rs means THIS coin is leading; negative rs + bullish alt
+  read usually means you are just trading BTC with extra noise.
 - `rsi_14bar`, `atr_14bar_pct`.
 - `path_pct`: the last ~24 bars as % change vs the first point of the
   window — the actual price SHAPE (grind-up, spike-and-fade, V-dip).

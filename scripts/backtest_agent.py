@@ -645,7 +645,9 @@ async def main() -> None:
         fr = {s: (funding[s][f] if f else None) for s, f in fr.items()}
         summaries = {s: compute_market_features(candles[s], upto_ts=ts,
                                                 funding_rate=fr[s],
-                                                bar_minutes=args.bar_minutes)
+                                                bar_minutes=args.bar_minutes,
+                                                ref_candles=(candles.get("BTC")
+                                                             if s != "BTC" else None))
                      for s in SYMBOLS}
         if any(v is None for v in summaries.values()):
             continue

@@ -878,7 +878,9 @@ class TradingAgent:
             symbols = [s for s in symbols if not s.startswith("U")]
             bar = os.getenv("FEATURE_BAR", "30m")
             derivs = await self._public_derivatives()
-            out: dict[str, Any] = {}
+            # fetch all symbols' candles first so cross-asset factors
+            # (BTC correlation / relative strength) can be computed
+            candles_by_sym: dict[str, list[dict]] = {}
             for sym in symbols:
                 data = await self._hb_rest("POST", "/market-data/candles", {
                     "connector_name": os.getenv("MARKET_PROBE_CONNECTOR",
@@ -905,9 +907,15 @@ class TradingAgent:
                     # connector has collected live — fall back to the public
                     # API (read-only market data, same venue) for full depth
                     candles = await self._public_candles(sym, bar)
+                candles_by_sym[sym] = candles
+            ref = candles_by_sym.get("BTC")
+            out: dict[str, Any] = {}
+            for sym in symbols:
+                candles = candles_by_sym[sym]
                 feats = compute_market_features(
                     candles,
-                    funding_rate=(derivs.get(sym) or {}).get("funding"))
+                    funding_rate=(derivs.get(sym) or {}).get("funding"),
+                    ref_candles=ref if sym != "BTC" else None)
                 if feats:
                     # compact price shape: % change vs first point of the
                     # window, so the LLM sees the actual path, not just
