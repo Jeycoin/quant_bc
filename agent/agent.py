@@ -850,6 +850,12 @@ class TradingAgent:
                         trades = []
                     if trades:
                         entry["recent_trades"] = trades
+                    try:
+                        stats = self.analytics.trade_stats(sym)
+                    except Exception:
+                        stats = None
+                    if stats:
+                        entry["track_record"] = stats
                 if entry:
                     out[sym] = entry
             if self.analytics is not None:
@@ -909,28 +915,46 @@ class TradingAgent:
                     candles = await self._public_candles(sym, bar)
                 candles_by_sym[sym] = candles
             ref = candles_by_sym.get("BTC")
+            funding_hist = self._funding_history(symbols)
             out: dict[str, Any] = {}
             for sym in symbols:
                 candles = candles_by_sym[sym]
                 feats = compute_market_features(
                     candles,
                     funding_rate=(derivs.get(sym) or {}).get("funding"),
-                    ref_candles=ref if sym != "BTC" else None)
+                    ref_candles=ref if sym != "BTC" else None,
+                    funding_history=funding_hist.get(sym))
                 if feats:
-                    # compact price shape: % change vs first point of the
-                    # window, so the LLM sees the actual path, not just
-                    # aggregate features (absolute level is in `price`)
-                    window = candles[-24:]
-                    base = window[0]["close"] if window else 0
-                    if base:
-                        feats["path_pct"] = [
-                            round((c["close"] / base - 1) * 100, 2) for c in window
-                        ]
-                        feats["path_bars"] = len(window)
                     out[sym] = feats
             return out or None
         except Exception:
             return None
+
+    def _funding_history(self, symbols: list[str],
+                         points: int = 21) -> dict[str, list[float]]:
+        """Recent funding rates per symbol from the intelligence store
+        (collector samples every 15 min). Used for funding momentum;
+        returns {} on any failure — funding_z_7d is simply None then."""
+        try:
+            import sqlite3 as _sqlite3
+
+            db = os.getenv("INTELLIGENCE_DB", "data/intelligence.db")
+            out: dict[str, list[float]] = {}
+            with _sqlite3.connect(db) as conn:
+                for sym in symbols:
+                    rows = conn.execute(
+                        "SELECT value FROM intel_signals"
+                        " WHERE kind='funding_rate' AND symbol=?"
+                        " ORDER BY ts DESC LIMIT ?",
+                        (sym, points * 32),  # dense sampling; downsample below
+                    ).fetchall()
+                    rates = [r[0] for r in reversed(rows) if r[0] is not None]
+                    if len(rates) >= 5:
+                        step = max(1, len(rates) // points)
+                        out[sym] = rates[::step][-points:]
+            return out
+        except Exception:
+            return {}
 
     async def _public_candles(self, coin: str, interval: str,
                               hours: int = 200) -> list[dict]:

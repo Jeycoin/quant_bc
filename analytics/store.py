@@ -228,6 +228,28 @@ class AnalyticsStore:
         ).fetchall()
         return [r[0][:200] for r in rows]
 
+    def trade_stats(self, symbol: str, limit: int = 20) -> dict[str, Any] | None:
+        """Aggregate track record over the last N closed trades on a symbol:
+        win rate, average win/loss, total. The agent's own calibration."""
+        rows = self._conn.execute(
+            "SELECT pnl_quote FROM trade_events"
+            " WHERE symbol = ? AND status = 'CLOSED' AND pnl_quote IS NOT NULL"
+            " ORDER BY ts_close DESC LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
+        if len(rows) < 3:
+            return None
+        pnls = [r[0] for r in rows]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        return {
+            "trades": len(pnls),
+            "win_rate": round(len(wins) / len(pnls), 2),
+            "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+            "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "total_pnl": round(sum(pnls), 2),
+        }
+
     # ---------------------------------------------------------------- trades
 
     def upsert_trade_event(

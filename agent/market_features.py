@@ -193,12 +193,15 @@ def compute_market_features(
     funding_rate: float | None = None,
     bar_minutes: int | None = None,
     ref_candles: list[dict] | None = None,
+    funding_history: list[float] | None = None,
 ) -> dict[str, Any] | None:
     """Multi-horizon features from ascending {timestamp, open, high, low,
     close, volume} candles. Returns None when history is insufficient.
 
     ref_candles: benchmark (BTC) candles for cross-asset factors
-    (correlation, relative strength, beta). Ignored for BTC itself."""
+    (correlation, relative strength, beta). Ignored for BTC itself.
+    funding_history: recent funding rates ascending (~8h spacing) for
+    funding momentum; current funding_rate should be its last point."""
     past = [c for c in candles if upto_ts is None or c["timestamp"] <= upto_ts]
     if len(past) < MIN_BARS:
         return None
@@ -302,6 +305,42 @@ def compute_market_features(
     # distance below the 24h range high (%): how much room to the ceiling
     dist_from_high_pct = round((price / hi48 - 1) * 100, 3) if hi48 else None
 
+    # price path shape: % change vs first point of the last 24 bars, so
+    # the LLM sees grind-up vs spike-and-fade (aggregates cannot tell)
+    window24 = past[-24:]
+    path_pct = None
+    if window24 and window24[0]["close"]:
+        base_px = float(window24[0]["close"])
+        path_pct = [round((float(c["close"]) / base_px - 1) * 100, 2)
+                    for c in window24]
+
+    # higher-timeframe alignment: resample to 2h bars from the same
+    # candles — 30m noise against a 2h trend is the classic losing fight
+    htf: dict[str, Any] = {}
+    factor = max(1, round(120 / bar_minutes))
+    if len(past) >= factor * 30:
+        groups = [past[i:i + factor]
+                  for i in range(0, len(past) - len(past) % factor, factor)]
+        htf_closes = [float(g[-1]["close"]) for g in groups]
+        if len(htf_closes) >= 26:
+            htf_fast = _ema(htf_closes[-16:], 8)
+            htf_slow = _ema(htf_closes, 21)
+            htf["ema_cross_2h"] = "BULL" if htf_fast > htf_slow else "BEAR"
+            htf["ret_6h_pct"] = round(
+                (htf_closes[-1] / htf_closes[-4] - 1) * 100, 3)
+            htf["rsi_2h"] = round(_rsi(htf_closes), 1)
+
+    # funding momentum: current funding vs its trailing distribution
+    # (~7d at 8h spacing). Extreme positive funding = crowded longs.
+    funding_z = None
+    if funding_history and len(funding_history) >= 5:
+        mu_f = sum(funding_history) / len(funding_history)
+        sd_f = (sum((f - mu_f) ** 2 for f in funding_history)
+                / len(funding_history)) ** 0.5
+        cur_f = funding_rate if funding_rate is not None else funding_history[-1]
+        if sd_f > 1e-12:
+            funding_z = round(min(max((cur_f - mu_f) / sd_f, -10.0), 10.0), 2)
+
     out: dict[str, Any] = {
         "bar_minutes": bar_minutes,
         "asof_ts": past[-1]["timestamp"],
@@ -347,6 +386,9 @@ def compute_market_features(
         "atr_14bar_pct": round(atr_pct_now, 3),
         # slow field: funding updates only every ~8h
         "funding_rate": funding_rate,
+        "funding_z_7d": funding_z,
+        "path_pct": path_pct,
+        "htf_2h": htf or None,
     }
 
     # cross-asset factors vs the benchmark (BTC): alt moves are mostly

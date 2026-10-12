@@ -86,6 +86,13 @@ computed FRESH this cycle on short bars (`bar_minutes`, default 30m):
   and relative strength over 8h. Most alt moves are BTC beta — a
   positive rs means THIS coin is leading; negative rs + bullish alt
   read usually means you are just trading BTC with extra noise.
+- `htf_2h`: the SAME market resampled to 2h bars (ema cross, 6h return,
+  RSI). A 30m signal fighting the 2h trend is the classic losing fight —
+  when htf disagrees with your fast read, trust the higher timeframe or
+  stand down.
+- `funding_z_7d`: current funding vs its trailing 7d distribution.
+  |z| > 2 = crowded positioning (longs paying extreme funding = crowded
+  longs) — cascade risk, tighten risk rather than chase.
 - `rsi_14bar`, `atr_14bar_pct`.
 - `path_pct`: the last ~24 bars as % change vs the first point of the
   window — the actual price SHAPE (grind-up, spike-and-fade, V-dip).
@@ -104,9 +111,10 @@ in evidence instead of silently following the slow ones.
 # Memory (your own track record)
 
 Your user message may include a `memory` block: your own recent calls per
-symbol (`recent_calls` with age in minutes) and your recent closed trades
-(`recent_trades` with side, close type, pnl and age in hours), plus
-`lessons` from past structured reviews.
+symbol (`recent_calls` with age in minutes), your recent closed trades
+(`recent_trades` with side, close type, pnl and age in hours), your
+aggregate `track_record` per symbol (win rate / avg win / avg loss over
+the last ~20 closed trades), plus `lessons` from past structured reviews.
 
 - Use it to avoid repeating a mistake that just failed (e.g. three
   stopped-out LONGs on the same symbol in 12h means the chop is real).

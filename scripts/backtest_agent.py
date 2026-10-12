@@ -643,12 +643,16 @@ async def main() -> None:
         elif i % decision_step != 0:
             continue
         fr = {s: max((f for f in funding[s] if f <= ts), default=None) for s in SYMBOLS}
+        fr_hist = {s: [funding[s][f] for f in sorted(f for f in funding[s]
+                                                     if f <= ts)][-21:]
+                   for s in SYMBOLS}
         fr = {s: (funding[s][f] if f else None) for s, f in fr.items()}
         summaries = {s: compute_market_features(candles[s], upto_ts=ts,
                                                 funding_rate=fr[s],
                                                 bar_minutes=args.bar_minutes,
                                                 ref_candles=(candles.get("BTC")
-                                                             if s != "BTC" else None))
+                                                             if s != "BTC" else None),
+                                                funding_history=fr_hist[s])
                      for s in SYMBOLS}
         if any(v is None for v in summaries.values()):
             continue
