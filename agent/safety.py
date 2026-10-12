@@ -8,6 +8,7 @@ It never modifies Hummingbot internals — it only allows or denies calls.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,23 @@ import yaml
 
 class SafetyViolation(Exception):
     """Raised when a tool call crosses the configured safety boundary."""
+
+
+def parse_executor_config(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return executor_config as a dict.
+
+    LLMs sometimes pass the nested executor_config as a JSON string.
+    Unparseable values degrade to {} — downstream checks (connector
+    allowlist in PAPER mode, etc.) then fail closed instead of crashing.
+    """
+    cfg = arguments.get("executor_config") or {}
+    if isinstance(cfg, str):
+        try:
+            parsed = json.loads(cfg)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
 @dataclass
@@ -52,7 +70,7 @@ class SafetyGuard:
 
     def _check_executor_create(self, arguments: dict[str, Any]) -> None:
         safety = self.config["safety"]
-        cfg = arguments.get("executor_config", {}) or {}
+        cfg = parse_executor_config(arguments)
 
         connector = str(cfg.get("connector_name", ""))
         pair = str(cfg.get("trading_pair", ""))

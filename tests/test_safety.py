@@ -1,5 +1,6 @@
 """SafetyGuard boundary tests — the core protection of this project."""
 
+import json
 import os
 
 import pytest
@@ -80,3 +81,17 @@ def test_live_mode_allows_live_connector(monkeypatch):
     guard.check_tool_call(
         "manage_executors", _paper_create(connector_name="binance_perpetual")
     )
+
+
+def test_executor_config_as_json_string_is_parsed(paper_guard):
+    args = _paper_create()
+    args["executor_config"] = json.dumps(args["executor_config"])
+    paper_guard.check_tool_call("manage_executors", args)
+
+
+def test_unparseable_executor_config_fails_closed(paper_guard):
+    with pytest.raises(SafetyViolation, match="PAPER mode"):
+        paper_guard.check_tool_call(
+            "manage_executors",
+            {"action": "create", "executor_config": "not-json{{"},
+        )

@@ -30,7 +30,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from agent.memory.store import MemoryStore
-from agent.safety import SafetyGuard, SafetyViolation
+from agent.safety import SafetyGuard, SafetyViolation, parse_executor_config
 from agent.validators import (
     GRID_DEFENSIVE,
     GRID_EXIT,
@@ -417,6 +417,12 @@ class TradingAgent:
                 return f"TOOL INPUT ERROR: arguments must be a JSON object, got: {arguments[:200]}"
         if not isinstance(arguments, dict):
             return f"TOOL INPUT ERROR: arguments must be a JSON object, got {type(arguments).__name__}"
+        # same quirk one level down: executor_config occasionally arrives as
+        # a JSON string; normalize so validators and the MCP call see a dict
+        if isinstance(arguments.get("executor_config"), str):
+            parsed_cfg = parse_executor_config(arguments)
+            if parsed_cfg:
+                arguments["executor_config"] = parsed_cfg
         try:
             self.guard.check_tool_call(name, arguments)
             await self._check_position_capacity(name, arguments)
@@ -481,7 +487,7 @@ class TradingAgent:
         Order: grid protection -> cost -> risk. Returns
         (rejection_message, stage) or (None, None) when all gates pass.
         """
-        cfg = arguments.get("executor_config", {}) or {}
+        cfg = parse_executor_config(arguments)
         etype = str(arguments.get("executor_type") or cfg.get("type") or "")
         pair = str(cfg.get("trading_pair", ""))
         symbol = pair.partition("-")[0] or None
@@ -735,7 +741,7 @@ class TradingAgent:
         if self.analytics is None:
             return
         try:
-            cfg = arguments.get("executor_config", {}) or {}
+            cfg = parse_executor_config(arguments)
             etype = str(arguments.get("executor_type") or cfg.get("type") or "")
             experiment = self.analytics.get_active_experiment()
             self.analytics.record_decision_event(
