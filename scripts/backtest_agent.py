@@ -498,7 +498,8 @@ async def main() -> None:
     funding = {}
     bar_interval = f"{args.bar_minutes}m"
     for sym in SYMBOLS:
-        all_c = await fetch_candles(sym, fetch_days, interval=bar_interval)
+        all_c = await fetch_candles(sym, fetch_days, interval=bar_interval,
+                                    end_ts=end_ts)
         candles[sym] = all_c
         funding[sym] = await fetch_funding(sym, warmup_ts * 1000)
         print(f"  {sym}: {len(all_c)} candles, {len(funding[sym])} funding points")
