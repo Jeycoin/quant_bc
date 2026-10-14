@@ -252,6 +252,27 @@ class AnalyticsStore:
 
     # ---------------------------------------------------------------- trades
 
+    def closed_trades(self, since_ts: float | None = None,
+                      limit: int = 200) -> list[dict[str, Any]]:
+        """Closed trades for the protections layer: symbol/side/pnl/
+        close_type/ts_close, ascending. Covers all sources — the breakers
+        must see manual and baseline closes too, not just the agent's."""
+        sql = ("SELECT symbol, side, pnl_quote, close_type, ts_close"
+               " FROM trade_events WHERE status = 'CLOSED'"
+               " AND ts_close IS NOT NULL")
+        params: list[Any] = []
+        if since_ts is not None:
+            sql += " AND ts_close >= ?"
+            params.append(since_ts)
+        sql += " ORDER BY ts_close DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [
+            {"symbol": r[0], "side": r[1], "pnl_quote": r[2],
+             "close_type": r[3], "ts_close": r[4]}
+            for r in reversed(rows)
+        ]
+
     def upsert_trade_event(
         self,
         executor_id: str,

@@ -41,6 +41,7 @@ from agent.validators import (
     evaluate_grid_state,
     validate_entry,
 )
+from agent.protections import evaluate_protections
 from analytics.store import AnalyticsStore, new_decision_id
 from analytics.versioning import current_versions
 from integrations.llm import create_llm_client
@@ -145,7 +146,6 @@ class TradingAgent:
         # approve. Fail-closed on missing economics data.
         self.cost_validator = CostValidator.from_config(guard.config)
         self.risk_validator = RiskValidator.from_config(guard.config)
-
     def _safe_record(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         """Memory writes are best-effort; a failure flips degraded mode."""
         try:
@@ -492,13 +492,33 @@ class TradingAgent:
     ) -> tuple[str | None, str | None]:
         """Deterministic gates before any executor is created.
 
-        Order: grid protection -> cost -> risk. Returns
-        (rejection_message, stage) or (None, None) when all gates pass.
+        Order: protections -> grid protection -> entry gate -> cost -> risk.
+        Returns (rejection_message, stage) or (None, None) when all gates
+        pass.
         """
         cfg = parse_executor_config(arguments)
         etype = str(arguments.get("executor_type") or cfg.get("type") or "")
         pair = str(cfg.get("trading_pair", ""))
         symbol = pair.partition("-")[0] or None
+
+        # 0. Protections (v1.4): post-hoc circuit breakers over closed-trade
+        #    outcomes — cooldown / stoploss guard / drawdown / low-profit
+        #    blacklist. Fail-open when analytics is unavailable (the other
+        #    gates still apply); an empty trade history locks nothing.
+        side_map = {1: "LONG", 2: "SHORT", "1": "LONG", "2": "SHORT",
+                    "BUY": "LONG", "SELL": "SHORT", "LONG": "LONG",
+                    "SHORT": "SHORT", "buy": "LONG", "sell": "SHORT"}
+        side = side_map.get(cfg.get("side"))
+        if self.analytics is not None:
+            try:
+                prot = evaluate_protections(
+                    self.analytics.closed_trades(), time.time(),
+                    config=self.guard.config)
+                locked = prot.blocks(symbol, side)
+                if locked:
+                    return f"PROTECTION — REJECTED: {locked}", "PROTECTION"
+            except Exception:
+                pass  # protections must never break the trading path
 
         # 1. Grid protection: objective candle features; blocks only on
         #    DEFENSIVE/EXIT (WARNING is logged via the rejection-free path).

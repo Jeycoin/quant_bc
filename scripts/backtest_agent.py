@@ -53,6 +53,7 @@ load_dotenv(REPO_ROOT / ".env")
 
 from agent.agent import extract_analysis_blocks, normalize_regime
 from agent.market_features import compute_market_features
+from agent.protections import evaluate_protections
 from agent.validators import (
     GRID_DEFENSIVE,
     GRID_EXIT,
@@ -571,8 +572,14 @@ async def main() -> None:
     equity_curve: list[dict] = []
     trade_count = 0
     consecutive_llm_errors = 0
-    cooldown_until: dict[tuple[str, str], float] = {}  # (symbol, side) -> ts
+    closed_records: list[dict] = []  # closed-trade outcomes for protections
     latest_regime: dict[str, str] = {}  # symbol -> last classified regime
+
+    # v1.4: protections config — CLI --cooldown-hours overrides the
+    # stop-cooldown so old experiment commands keep their exact semantics
+    prot_cfg = dict(settings)
+    prot_cfg["protections"] = dict((settings or {}).get("protections", {}))
+    prot_cfg["protections"]["cooldown_stop_hours"] = args.cooldown_hours
 
     timeline = [c["timestamp"] for c in candles["BTC"] if start_ts <= c["timestamp"] <= end_ts]
     by_ts = {s: {c["timestamp"]: c for c in candles[s]} for s in SYMBOLS}
@@ -593,13 +600,11 @@ async def main() -> None:
                 pnl, reason, fees = result
                 cash += pos.margin + pnl
                 positions.remove(pos)
-                # v0.8: TIME_STOP joins the cooldown trigger. A time-stopped
-                # position means the thesis had no momentum — re-entering the
-                # same chop immediately was the SUI churn loss source
-                # (14 time-stops in 7d, -13.13 net on one symbol)
-                if reason in ("STOP_LOSS", "LIQUIDATION", "TIME_STOP") \
-                        and args.cooldown_hours > 0:
-                    cooldown_until[(pos.symbol, pos.side)] = ts + args.cooldown_hours * 3600
+                # v1.4: every close feeds the protections layer (cooldown,
+                # stoploss guard, drawdown, low-profit blacklist)
+                closed_records.append({
+                    "symbol": pos.symbol, "side": pos.side,
+                    "pnl_quote": pnl, "close_type": reason, "ts_close": ts})
                 if not prefix:
                     store.upsert_trade_event(
                         executor_id=pos.executor_id, ts_open=pos.opened_ts, ts_close=ts,
@@ -687,7 +692,13 @@ async def main() -> None:
                 csym = cl["symbol"]
                 if csym in grids:
                     g = grids.pop(csym)
-                    cash += g.sim.equity(px.get(csym) or summaries[csym]["price"])
+                    close_px = px.get(csym) or summaries[csym]["price"]
+                    cash += g.sim.equity(close_px)
+                    closed_records.append({
+                        "symbol": csym, "side": None,
+                        "pnl_quote": g.sim.equity(close_px) - args.grid_size,
+                        "close_type": cl.get("close_type") or "REGIME_EXIT",
+                        "ts_close": ts})
         elif args.counterfactual_exp:
             # source run's LLM proposals, verbatim — but from here on they go
             # through the live validation path (current gates), not the mirror
@@ -795,11 +806,19 @@ async def main() -> None:
             grid_state = evaluate_grid_state(
                 compute_grid_features(sym_candles), regime=regime, config=settings)
 
+            # v1.4: post-hoc circuit breakers over closed-trade outcomes
+            # (cooldown / stoploss guard / drawdown / low-profit blacklist).
+            # Evaluated per block — closes inside this same decision point
+            # can escalate the lock for later blocks.
+            prot = evaluate_protections(closed_records, ts, config=prot_cfg)
+
             # deterministic execution policy — proposals pass through the
             # same cost/risk/protection gates as the live path (v0.4)
             if block.get("strategy") == "grid" and regime == "RANGING" and sym not in grids:
                 rejection = None
-                if grid_state.state in (GRID_DEFENSIVE, GRID_EXIT):
+                if prot_lock := prot.blocks(sym):
+                    rejection = ("PROTECTION", prot_lock)
+                elif grid_state.state in (GRID_DEFENSIVE, GRID_EXIT):
                     rejection = ("GRID_REJECTED",
                                  f"{grid_state.state}: {'; '.join(grid_state.reasons)}")
                 else:
@@ -833,6 +852,9 @@ async def main() -> None:
                 g = grids.pop(sym)
                 cash += g.sim.equity(price)
                 closed_pnl = g.sim.equity(price) - args.grid_size
+                closed_records.append({
+                    "symbol": sym, "side": None, "pnl_quote": closed_pnl,
+                    "close_type": close_type, "ts_close": ts})
                 store.upsert_trade_event(
                     executor_id=g.executor_id, ts_open=g.opened_ts, ts_close=ts,
                     symbol=sym, strategy="grid_executor", status="CLOSED",
@@ -860,17 +882,16 @@ async def main() -> None:
                                      f"(dispersion {xs['dispersion']:.2f})")
                 # 1. deterministic entry gate (framework v0.5): direction
                 #    must align with 8h momentum / EMA cross / RSI / volume;
-                #    stop-out cooldown blocks re-entry into the same chop
+                #    protections (v1.4) block re-entry into recent chop losses
                 if xs_reject:
                     risk_status, rejection_reason = "ENTRY_REJECTED", xs_reject
                 elif not (gate := validate_entry(summaries[sym], action, regime,
                                                  config=settings)).approved:
                     risk_status = "ENTRY_REJECTED"
                     rejection_reason = "; ".join(gate.reasons)
-                elif ts < cooldown_until.get((sym, action), 0):
-                    risk_status = "COOLDOWN"
-                    rejection_reason = (f"{sym} {action} in post-stop cooldown "
-                                        f"({args.cooldown_hours:g}h)")
+                elif prot_lock := prot.blocks(sym, action):
+                    risk_status = "PROTECTION"
+                    rejection_reason = prot_lock
                 else:
                     tp_eff, sl_eff = position_barriers(
                         summaries[sym].get("atr_14bar_pct"), args,
@@ -973,6 +994,7 @@ async def main() -> None:
 
     # baselines over the same window: fixed grid + fixed trend + buy&hold
     from analytics import metrics as m
+    from analytics.fitness import composite_fitness
     agent_eq = m.equity_metrics(equity_curve)
     baselines = {}
     for sym in SYMBOLS:
@@ -1046,6 +1068,13 @@ async def main() -> None:
         "start_equity": equity_curve[0]["equity"],
         "final_equity": equity_curve[-1]["equity"],
         "agent_equity_metrics": agent_eq,
+        # v1.4: composite fitness (GT-Score-inspired: Sharpe × payoff ×
+        # cross-window consistency × turnover penalty) — the ranking number
+        # for experiment comparison, not a significance test
+        "agent_fitness": composite_fitness(
+            [t for t in store.list_trade_events(exp_id)
+             if t.get("source") == "agent"],
+            equity_snapshots=equity_curve),
         "trade_count": trade_count,
         "baselines": baselines,
         "baseline_notional": {"fixed_grid": args.grid_size, "trend": notional,

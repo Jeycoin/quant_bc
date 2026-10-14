@@ -1,4 +1,4 @@
-# AI Quant Trading System — 综合概述(v1.2+,2026-10-12)
+# AI Quant Trading System — 综合概述(v1.4,2026-10-14)
 
 > 一个 AI 驱动的加密货币量化研究与执行平台。LLM 负责理解市场、提出假设;
 > 确定性代码负责算术、风控与底线;Hummingbot 负责成熟执行;回放与消融
@@ -29,11 +29,13 @@ Intelligence Layer(intelligence.db)
         │
         ▼
 Trading Agent(glm-4.5-air, 单 Agent, 30min 决策周期)
-  输入: 36 因子/币种 + 价格路径 + 情报快照 + 组合状态 + 自身记忆
+  输入: 44 因子/币种 + 价格路径 + 情报快照 + 组合状态 + 自身记忆
   输出: 结构化提案(regime / action / confidence / evidence)
         │
         ▼
-五道确定性门控(全部只看客观数字,不看 LLM 文字)
+六道确定性门控(全部只看客观数字,不看 LLM 文字)
+  ⓪ Protections(v1.4) 事后熔断:冷却 / 连续止损全局暂停 /
+                     回撤熔断 / 低收益币拉黑(Freqtrade 四件套改编)
   ① Safety Guard    PAPER/LIVE 隔离、币种白名单、单笔/持仓上限
   ② Grid Protection  NORMAL/WARNING/DEFENSIVE/EXIT(仅网格)
   ③ Entry Gate       方向单必须顺 8h 动量+EMA,RSI 衰竭保护,
@@ -59,17 +61,23 @@ Dashboard(:3000 前端 / :8200 后端): KPI / 决策时间线 / 拒绝分析 /
 
 ## 3. AI 的输入(每 30 分钟,每币种)
 
-**市场因子(36 个,实盘与回放同一函数计算)**
+**市场因子(44 个,实盘与回放同一函数计算)**
 - 收益: 1/2/4/8/16/48 bar 收益率(30m–24h)
 - 趋势: EMA8/21 交叉与距离、EMA50 偏离、ADX(趋势强度)、
-  Kaufman 效率比、MACD 柱
+  Kaufman 效率比、MACD 柱、EWO(v1.4,归一化 EMA5/35 差)
 - 波动: 8/48bar 已实现波动、布林带宽(挤压检测)、ATR% 及其
   历史分位(vol regime)
 - 量价: 成交量 z(含时段去季节化版本)、上涨 bar 量能占比、
-  VWAP 偏离、连续涨/跌根数、RSI 及斜率
+  VWAP 偏离、连续涨/跌根数、RSI 及斜率、
+  量价背离 pv_corr_12bar(v1.4,Alpha101 #22 式)
 - 位置: 4h/24h 区间位置、距区间高点距离、距新高经过的 bar 数
-- 形态: 最近 24 根 bar 的价格路径(%序列,AI 能看到形状)
-- 衍生品: 资金费率、OI 及 24h 变化
+- 反转: ret_rank_4bar/8bar(v1.4,短线涨幅在自身分布中的分位,
+  加密最稳的反转异象)
+- 形态: 最近 24 根 bar 的价格路径(%序列,AI 能看到形状)、
+  影线解剖 + 清算级联代理 cascade_signal(v1.4)
+- Regime: Choppiness Index(v1.4,>61.8 震荡 <38.2 趋势,
+  ADX/效率比之外的第三视角)
+- 衍生品: 资金费率、OI 及 24h 变化、funding_z_7d
 - 跨币种: 与 BTC 的 48bar 相关性、8h 相对强度(识别"真领涨
   vs 只是 BTC beta")
 

@@ -168,7 +168,40 @@ def _vwap_dist_pct(candles: list[dict], n: int = 48) -> float | None:
     return round((price / vwap - 1) * 100, 3) if vwap else None
 
 
+def _ts_rank(values: list[float]) -> float | None:
+    """Rank of the latest value within the series (0..1). High = the latest
+    point sits at the top of its own trailing window."""
+    if len(values) < 5:
+        return None
+    last = values[-1]
+    below = sum(1 for v in values if v <= last)
+    return round(below / len(values), 2)
+
+
+def _choppiness(candles: list[dict], n: int = 14) -> float | None:
+    """Choppiness Index: 100*log10(sum(ATR,n)/(maxHigh-minLow))/log10(n).
+    >61.8 = chop, <38.2 = trending. Direction-agnostic regime measure —
+    complements ADX/efficiency ratio as a third opinion."""
+    if len(candles) < n + 1:
+        return None
+    import math
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+    closes = [float(c["close"]) for c in candles]
+    trs = [max(highs[i] - lows[i],
+               abs(highs[i] - closes[i - 1]),
+               abs(lows[i] - closes[i - 1]))
+           for i in range(1, len(candles))]
+    atr_sum = sum(trs[-n:])
+    hi = max(highs[-n:])
+    lo = min(lows[-n:])
+    if hi <= lo or atr_sum <= 0:
+        return None
+    return round(100 * math.log10(atr_sum / (hi - lo)) / math.log10(n), 1)
+
+
 def _corr(a: list[float], b: list[float]) -> float | None:
+    """Correlation of RETURNS (pct changes) — for cross-asset factors."""
     n = min(len(a), len(b))
     if n < 10:
         return None
@@ -178,10 +211,19 @@ def _corr(a: list[float], b: list[float]) -> float | None:
     if m < 10:
         return None
     ra, rb = ra[-m:], rb[-m:]
-    ma, mb = sum(ra) / m, sum(rb) / m
-    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
-    va = sum((x - ma) ** 2 for x in ra)
-    vb = sum((y - mb) ** 2 for y in rb)
+    return _pearson(ra, rb)
+
+
+def _pearson(a: list[float], b: list[float]) -> float | None:
+    """Plain Pearson correlation of levels/ranks."""
+    m = min(len(a), len(b))
+    if m < 5:
+        return None
+    a, b = a[-m:], b[-m:]
+    ma, mb = sum(a) / m, sum(b) / m
+    cov = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((y - mb) ** 2 for y in b)
     if va <= 0 or vb <= 0:
         return None
     return round(cov / (va * vb) ** 0.5, 2)
@@ -341,6 +383,65 @@ def compute_market_features(
         if sd_f > 1e-12:
             funding_z = round(min(max((cur_f - mu_f) / sd_f, -10.0), 10.0), 2)
 
+    # --- v1.4 factors (borrowed from Phandas/Freqtrade/GP-mining evidence) --
+
+    # short-term reversal rank: where the latest n-bar return sits inside its
+    # own trailing 48-window distribution. >0.8 = overextended up (fade
+    # candidate), <0.2 = overextended down. Crypto's most robust anomaly is
+    # short-horizon reversal; pure momentum factors cannot express it.
+    ret_rank_4bar = None
+    ret_rank_8bar = None
+    if len(closes) >= 53:
+        rets4 = [closes[i] / closes[i - 4] - 1 for i in range(52, len(closes))]
+        rets8 = [closes[i] / closes[i - 8] - 1 for i in range(52, len(closes))]
+        ret_rank_4bar = _ts_rank(rets4[-48:])
+        ret_rank_8bar = _ts_rank(rets8[-48:])
+
+    # price-volume divergence (Alpha101 #22 family): correlation of
+    # rank(close) vs rank(volume) over 12 bars. Negative = price rising on
+    # shrinking volume (or falling on expanding) — trend losing its fuel.
+    pv_corr_12bar = None
+    if len(closes) >= 17:
+        w_c = closes[-12:]
+        w_v = vols[-12:]
+
+        def _ranks(xs: list[float]) -> list[float]:
+            order = sorted(range(len(xs)), key=lambda i: xs[i])
+            r = [0.0] * len(xs)
+            for pos, idx in enumerate(order):
+                r[idx] = float(pos)
+            return r
+
+        pv_corr_12bar = _pearson(_ranks(w_c), _ranks(w_v))
+
+    # EWO (Elliott Wave Oscillator, Freqtrade NFI/ElliotV2 core): normalized
+    # EMA5-EMA35 difference — slower than our 8/21 cross, the community's
+    # standard dip-buying momentum gauge on 30m crypto.
+    ewo_pct = None
+    if len(closes) >= 40:
+        ewo_pct = round((_ema(closes, 5) - _ema(closes, 35)) / price * 100, 3) \
+            if price else None
+
+    chop_14bar = _choppiness(past)
+
+    # liquidation-cascade proxy: last-bar wick anatomy + volume spike.
+    # Long lower wick on a volume surge = forced sellers absorbed
+    # (capitulation, bounce candidate); long upper wick = distribution.
+    upper_wick_pct = lower_wick_pct = None
+    cascade_signal = None
+    last = past[-1]
+    o, h, l, c = (float(last["open"]), float(last["high"]),
+                  float(last["low"]), float(last["close"]))
+    bar_range = h - l
+    if bar_range > 0:
+        upper_wick_pct = round((h - max(o, c)) / bar_range * 100, 1)
+        lower_wick_pct = round((min(o, c) - l) / bar_range * 100, 1)
+        if volume_z is not None and volume_z >= 2.0:
+            if lower_wick_pct >= 50:
+                cascade_signal = "CAPITULATION"
+            elif upper_wick_pct >= 50:
+                cascade_signal = "DISTRIBUTION"
+
     out: dict[str, Any] = {
         "bar_minutes": bar_minutes,
         "asof_ts": past[-1]["timestamp"],
@@ -387,6 +488,14 @@ def compute_market_features(
         # slow field: funding updates only every ~8h
         "funding_rate": funding_rate,
         "funding_z_7d": funding_z,
+        "ret_rank_4bar": ret_rank_4bar,
+        "ret_rank_8bar": ret_rank_8bar,
+        "pv_corr_12bar": pv_corr_12bar,
+        "ewo_pct": ewo_pct,
+        "chop_14bar": chop_14bar,
+        "upper_wick_pct": upper_wick_pct,
+        "lower_wick_pct": lower_wick_pct,
+        "cascade_signal": cascade_signal,
         "path_pct": path_pct,
         "htf_2h": htf or None,
     }

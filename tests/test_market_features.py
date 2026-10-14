@@ -99,3 +99,58 @@ def test_deseason_volume_corrects_time_of_day_bias():
     assert f["volume_z_48bar"] > 5          # raw z screams "abnormal"
     assert f["volume_z_deseason"] is not None
     assert abs(f["volume_z_deseason"]) < 2  # deseasonalized: just Tuesday
+
+
+# ----------------------------------------------------------- v1.4 factors
+
+def test_v14_factors_present_on_flat_market():
+    f = compute_market_features(_candles([100.0] * 60))
+    for key in ("ret_rank_4bar", "ret_rank_8bar", "pv_corr_12bar",
+                "ewo_pct", "chop_14bar", "upper_wick_pct", "lower_wick_pct",
+                "cascade_signal"):
+        assert key in f
+    # flat market: EWO ≈ 0, CHOP = 100 (pure chop, zero range => None ok)
+    assert abs(f["ewo_pct"]) < 1e-6
+    assert f["cascade_signal"] is None
+
+
+def test_ret_rank_high_after_spike():
+    # long flat then one sharp jump at the very end: the latest 4/8-bar
+    # return tops its own trailing distribution
+    closes = [100.0] * 106 + [100.1, 100.2, 100.3, 105.0]
+    f = compute_market_features(_candles(closes))
+    assert f["ret_rank_4bar"] >= 0.9
+    assert f["ret_rank_8bar"] >= 0.9
+
+
+def test_choppiness_low_in_trend():
+    closes = [100.0 + i for i in range(70)]  # clean monotonic trend
+    f = compute_market_features(_candles(closes))
+    assert f["chop_14bar"] < 38.2
+
+
+def test_choppiness_high_in_pingpong():
+    closes = [100.0 if i % 2 == 0 else 101.0 for i in range(70)]
+    f = compute_market_features(_candles(closes))
+    assert f["chop_14bar"] > 61.8
+
+
+def test_cascade_capitulation_flag():
+    # long lower wick on a volume spike = forced sellers absorbed
+    candles = _candles([100.0] * 59 + [99.0], [100.0] * 59 + [2000.0])
+    last = candles[-1]
+    last["open"] = 100.0
+    last["low"] = 95.0
+    last["high"] = 100.1
+    last["close"] = 99.8
+    f = compute_market_features(candles)
+    assert f["cascade_signal"] == "CAPITULATION"
+    assert f["lower_wick_pct"] > 50
+
+
+def test_pv_corr_negative_on_divergence():
+    # price rising while volume shrinks bar by bar -> negative rank corr
+    closes = [100.0] * 48 + [100.1 * (1.002 ** i) for i in range(12)]
+    volumes = [100.0] * 48 + [200.0 - 10 * i for i in range(12)]
+    f = compute_market_features(_candles(closes, volumes))
+    assert f["pv_corr_12bar"] < -0.5

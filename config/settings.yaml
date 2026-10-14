@@ -70,3 +70,27 @@ entry_gate:
   long_max_pos: 0.6      # LONG only in the lower 60% of the 8-bar range
   short_min_pos: 0.4     # SHORT only in the upper 60%
   min_vol_ratio: 0.7     # block entries when vol_8bar/vol_48bar collapses
+
+# Post-hoc circuit breakers (agent/protections.py, v1.4 — Freqtrade
+# Protections adapted). Evaluated from closed-trade OUTCOMES, orthogonal to
+# the pre-trade gates above. Replaces the ad-hoc backtest cooldown.
+protections:
+  enabled: true
+  cooldown_hours: 0        # per-symbol lock after ANY close (0 = off)
+  cooldown_stop_hours: 6   # per symbol+side lock after a losing/stop close
+  stoploss_guard:          # losing streak -> global pause
+    enabled: true
+    lookback_hours: 24
+    trade_limit: 4
+    stop_duration_hours: 6
+  max_drawdown:            # realized-PnL drawdown -> global pause
+    enabled: true
+    lookback_hours: 72
+    max_allowed_pct: 3     # of reference equity (10k)
+    stop_duration_hours: 12
+  low_profit_pairs:        # persistent losers get blacklisted
+    enabled: true
+    lookback_hours: 168
+    min_trades: 4
+    required_profit_quote: 0
+    stop_duration_hours: 72
