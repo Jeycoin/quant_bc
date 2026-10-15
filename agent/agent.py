@@ -431,6 +431,18 @@ class TradingAgent:
             parsed_cfg = parse_executor_config(arguments)
             if parsed_cfg:
                 arguments["executor_config"] = parsed_cfg
+        # v1.4.1: grids must NOT keep leftover inventory. With
+        # keep_position=true, a grid that falls out of range leaves the
+        # bought base as a naked long — the XRP grid's arbitrage leg made
+        # +3.55 while its leftover 415-XRP inventory bled -17.9 in the
+        # downtrend (2026-10-15 report). Forced here, not requested in the
+        # prompt, so the LLM cannot talk its way back into it.
+        if name == "manage_executors" and arguments.get("action") == "create":
+            cfg = arguments.get("executor_config")
+            etype = str(arguments.get("executor_type") or
+                        (cfg or {}).get("type") or "")
+            if isinstance(cfg, dict) and "grid" in etype:
+                cfg["keep_position"] = False
         try:
             self.guard.check_tool_call(name, arguments)
             await self._check_position_capacity(name, arguments)
