@@ -422,6 +422,19 @@ async def main() -> None:
                         help="portfolio layer: risk-budget multiplier per "
                              "additional same-direction position")
     parser.add_argument("--grid-size", type=float, default=GRID_SIZE)
+    parser.add_argument("--grid-range-pct", type=float, default=GRID_RANGE_PCT,
+                        help="grid half-width as a fraction of price "
+                             "(counterfactual: widened-grid intervention)")
+    parser.add_argument("--grid-tp", type=float, default=GRID_TP,
+                        help="grid level spacing / per-cycle take-profit "
+                             "(counterfactual: wider-spacing intervention)")
+    parser.add_argument("--grid-adx-max", type=float, default=None,
+                        help="trend filter: block NEW grid opens when "
+                             "adx_14bar exceeds this (counterfactual)")
+    parser.add_argument("--symbol-cooldown-hours", type=float, default=None,
+                        help="turnover limiter: per-symbol lock after ANY "
+                             "close (maps to protections.cooldown_hours; "
+                             "default keeps settings.yaml value)")
     parser.add_argument("--max-total-exposure", type=float, default=None,
                         help="override risk.max_total_exposure_quote for this run")
     parser.add_argument("--max-symbol-exposure", type=float, default=None,
@@ -531,7 +544,10 @@ async def main() -> None:
                  f"cooldown_h={args.cooldown_hours:g} "
                  f"xs={'on' if args.cross_section else 'off'}(top{args.top_n},"
                  f"disp>={args.min_dispersion:g},samedir={args.same_dir_discount:g}) "
-                 f"min_conf={args.min_confidence:g}")
+                 f"min_conf={args.min_confidence:g} "
+                 f"grid_range={args.grid_range_pct:g} grid_tp={args.grid_tp:g} "
+                 f"grid_adx_max={args.grid_adx_max} "
+                 f"sym_cd_h={args.symbol_cooldown_hours}")
     if exp_id is None:
         if args.counterfactual_exp:
             exp_name = f"bt-counterfactual-{args.counterfactual_exp}"
@@ -580,6 +596,8 @@ async def main() -> None:
     prot_cfg = dict(settings)
     prot_cfg["protections"] = dict((settings or {}).get("protections", {}))
     prot_cfg["protections"]["cooldown_stop_hours"] = args.cooldown_hours
+    if args.symbol_cooldown_hours is not None:
+        prot_cfg["protections"]["cooldown_hours"] = args.symbol_cooldown_hours
 
     timeline = [c["timestamp"] for c in candles["BTC"] if start_ts <= c["timestamp"] <= end_ts]
     by_ts = {s: {c["timestamp"]: c for c in candles[s]} for s in SYMBOLS}
@@ -770,9 +788,9 @@ async def main() -> None:
                 if rec.get("outcome_status") == "EXECUTED":
                     if eid.startswith("bt-grid-") and sym not in grids:
                         grids[sym] = SimGrid(
-                            GridSim(price * (1 - GRID_RANGE_PCT),
-                                    price * (1 + GRID_RANGE_PCT),
-                                    args.grid_size, tp=GRID_TP),
+                            GridSim(price * (1 - args.grid_range_pct),
+                                    price * (1 + args.grid_range_pct),
+                                    args.grid_size, tp=args.grid_tp),
                             sym, ts, eid, rec.get("market_regime"))
                         cash -= args.grid_size
                         trade_count += 1
@@ -821,8 +839,14 @@ async def main() -> None:
                 elif grid_state.state in (GRID_DEFENSIVE, GRID_EXIT):
                     rejection = ("GRID_REJECTED",
                                  f"{grid_state.state}: {'; '.join(grid_state.reasons)}")
+                elif args.grid_adx_max is not None and \
+                        (summaries[sym].get("adx_14bar") or 0) > args.grid_adx_max:
+                    rejection = ("GRID_REJECTED",
+                                 f"trend filter: adx_14bar "
+                                 f"{summaries[sym]['adx_14bar']:.1f} > "
+                                 f"{args.grid_adx_max:g}")
                 else:
-                    cost = cost_validator.validate_grid(args.grid_size, GRID_TP,
+                    cost = cost_validator.validate_grid(args.grid_size, args.grid_tp,
                                                         maker_entry=True, maker_exit=True)
                     if not cost.approved:
                         rejection = ("COST_REJECTED", cost.summary())
@@ -839,8 +863,9 @@ async def main() -> None:
                 else:
                     execution_id = f"bt-grid-{sym}-{int(ts)}{run_ns}"
                     grids[sym] = SimGrid(
-                        GridSim(price * (1 - GRID_RANGE_PCT), price * (1 + GRID_RANGE_PCT),
-                                args.grid_size, tp=GRID_TP),
+                        GridSim(price * (1 - args.grid_range_pct),
+                                price * (1 + args.grid_range_pct),
+                                args.grid_size, tp=args.grid_tp),
                         sym, ts, execution_id, regime)
                     cash -= args.grid_size
                     trade_count += 1
@@ -1000,7 +1025,9 @@ async def main() -> None:
     for sym in SYMBOLS:
         window = [c for c in candles[sym] if start_ts <= c["timestamp"] <= end_ts]
         first, last = float(window[0]["close"]), float(window[-1]["close"])
-        base = GridSim(first * 0.97, first * 1.03, args.grid_size, tp=GRID_TP)
+        base = GridSim(first * (1 - args.grid_range_pct),
+                       first * (1 + args.grid_range_pct),
+                       args.grid_size, tp=args.grid_tp)
         for c in window:
             base.process_candle(c)
         store.upsert_trade_event(
