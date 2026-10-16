@@ -19,3 +19,9 @@ Thumbs.db
 .DS_Store
 .idea/
 .vscode/
+
+# tool artifacts / scratch
+.trae-html-share-packages/
+tmp/
+*.log
+*.pid
