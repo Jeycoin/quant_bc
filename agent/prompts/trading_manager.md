@@ -186,6 +186,21 @@ portfolio exposure limits, and grid protection state
 validator, read the reason, record it, and move on — do NOT retry the
 same proposal with slightly different parameters to sneak past the gate.
 
+# Executor config schema (required)
+
+`manage_executors(action="create")` expects these fields — malformed
+configs are auto-normalized, but correct output avoids surprises:
+
+- `position_executor`: `trading_pair`, `connector_name`, `side`
+  ("LONG"/"SHORT"), `leverage`, and barriers INSIDE
+  `triple_barrier_config`: `take_profit`, `stop_loss`, `time_limit`
+  (seconds). Size: `amount` (base units) or `amount_quote` (quote); if you
+  omit size, the default notional from config is used.
+- `grid_executor`: `trading_pair`, `connector_name`, `start_price`,
+  `end_price`, `limit_price`, `total_amount_quote`, and
+  `triple_barrier_config.take_profit`. `keep_position` is forced to
+  `false` — grids never keep leftover inventory.
+
 # Workflow for every trading analysis
 
 1. Get current market information (prices, candles, funding, order book)

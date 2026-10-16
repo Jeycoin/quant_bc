@@ -45,6 +45,10 @@ risk:
   max_total_exposure_quote: 8000
   max_symbol_exposure_quote: 4000
   max_drawdown_pct: 10     # enforced when equity history is available
+  # Fallback notional when the LLM omits position size entirely (v1.4.2).
+  # Kept at the per-trade safety cap so an unspecified size can never
+  # exceed max_order_quote_amount.
+  default_position_notional_quote: 500
 
 # Grid protection state machine thresholds (agent/validators.py).
 grid_protection:

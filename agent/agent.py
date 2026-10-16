@@ -443,6 +443,16 @@ class TradingAgent:
                         (cfg or {}).get("type") or "")
             if isinstance(cfg, dict) and "grid" in etype:
                 cfg["keep_position"] = False
+            # v1.4.2: normalize position-executor configs into the shape
+            # Hummingbot and the validators actually understand. The LLM
+            # kept emitting take_profit/stop_loss at top level (Hummingbot
+            # wants them inside triple_barrier_config) and amount_quote
+            # instead of base-unit amount — since 09-28 every directional
+            # proposal died at the cost gate with "could not determine
+            # trade notional". Normalize here so validators AND the MCP
+            # call see the same canonical config.
+            if isinstance(cfg, dict) and "position" in etype:
+                await self._normalize_position_config(cfg)
         try:
             self.guard.check_tool_call(name, arguments)
             await self._check_position_capacity(name, arguments)
@@ -666,6 +676,51 @@ class TradingAgent:
         except Exception:
             return None
 
+    async def _normalize_position_config(self, cfg: dict[str, Any]) -> None:
+        """Canonicalize an LLM-produced position-executor config in place.
+
+        - moves top-level take_profit/stop_loss/time_limit into
+          triple_barrier_config (Hummingbot only reads them there)
+        - resolves size to base-unit `amount`: accepts `amount`,
+          `amount_quote`/`total_amount_quote`/`notional_quote` (converted at
+          the current price), or falls back to the configured default
+          notional when the LLM omitted size entirely
+        """
+        barrier = cfg.setdefault("triple_barrier_config", {})
+        if not isinstance(barrier, dict):
+            barrier = {}
+            cfg["triple_barrier_config"] = barrier
+        for key in ("take_profit", "stop_loss", "time_limit",
+                    "trailing_stop", "open_order_type",
+                    "take_profit_order_type", "stop_loss_order_type",
+                    "time_limit_order_type"):
+            if barrier.get(key) is None and cfg.get(key) is not None:
+                barrier[key] = cfg.pop(key)
+
+        if cfg.get("amount") is not None:
+            return
+        quote = (cfg.get("amount_quote") or cfg.get("total_amount_quote")
+                 or cfg.get("notional_quote"))
+        if quote is None:
+            quote = (self.guard.config.get("risk", {}) or {}).get(
+                "default_position_notional_quote", 500)
+        price = await self._current_price(cfg)
+        if price and price > 0:
+            cfg["amount"] = round(float(quote) / price, 8)
+            cfg.pop("amount_quote", None)
+
+    def _position_notional(self, cfg: dict[str, Any],
+                           price: float | None) -> float | None:
+        """Notional quote of a position config: amount*price, or the
+        quote-sized field directly. None when neither is determinable."""
+        amount = cfg.get("amount")
+        if amount is not None and price:
+            return float(amount) * price
+        for key in ("amount_quote", "total_amount_quote", "notional_quote"):
+            if cfg.get(key) is not None:
+                return float(cfg[key])
+        return None
+
     async def _cost_check(self, etype: str, cfg: dict[str, Any]):
         """Run the cost validator for a grid/position executor config."""
         barrier = cfg.get("triple_barrier_config", {}) or {}
@@ -683,13 +738,14 @@ class TradingAgent:
                 max_open_orders=cfg.get("max_open_orders"),
                 maker_entry=maker_entry, maker_exit=maker_exit,
             )
-        # position executor: notional = base amount * current price
-        amount = cfg.get("amount")
-        tp = barrier.get("take_profit")
-        if amount is None or tp is None:
-            return None
+        # position executor: notional = base amount * current price, or a
+        # quote-sized field directly; TP may live at top level or in
+        # triple_barrier_config (both normalized upstream, but stay
+        # tolerant here)
+        tp = barrier.get("take_profit", cfg.get("take_profit"))
         price = await self._current_price(cfg)
-        if not price:
+        notional = self._position_notional(cfg, price)
+        if notional is None or tp is None:
             return None
         # funding is a real holding cost for positions that cross a
         # settlement window (every ~8h); charge it when we would pay,
@@ -706,7 +762,7 @@ class TradingAgent:
         hold_h = float((self.guard.config.get("cost", {}) or {})
                        .get("expected_hold_hours", 8.0))
         return self.cost_validator.validate_position(
-            float(amount) * price, float(tp),
+            notional, float(tp),
             funding_rate=funding, expected_hold_hours=hold_h, side=side,
         )
 
@@ -737,11 +793,8 @@ class TradingAgent:
         if "grid" in etype:
             amount = cfg.get("total_amount_quote")
             return float(amount) if amount is not None else None
-        amount = cfg.get("amount")
         price = await self._current_price(cfg)
-        if amount is None or not price:
-            return None
-        return float(amount) * price
+        return self._position_notional(cfg, price)
 
     async def _current_exposure(self) -> dict[str, float] | None:
         """Per-symbol quote exposure of RUNNING executors, from their
