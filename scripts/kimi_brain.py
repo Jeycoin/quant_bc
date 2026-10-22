@@ -680,12 +680,15 @@ class KimiBrain:
             return f"无 ref_price 或现价,无法跟踪{suffix}"
         c = change_pct
         if action in ("WAIT", "WATCH"):
-            if abs(c) < 0.3:
-                comment = "横盘,判断暂未被证伪"
-            elif abs(c) >= 0.5:
-                comment = "波动放大,观望前提需重新评估"
+            # direction-aware: after WAIT/WATCH a price DROP means the
+            # caution was correct (loss avoided); a RISE is opportunity
+            # cost worth re-examining
+            if c <= -0.3:
+                comment = f"观望正确,规避下跌 {c:+.2f}%"
+            elif c >= 0.3:
+                comment = f"错过反弹 {c:+.2f}%,复核是否该更积极"
             else:
-                comment = "小幅波动,观望前提未明显变化"
+                comment = "横盘,判断暂未被证伪"
             return f"{action} 后价格 {c:+.2f}%({comment})"
         if action == "PROPOSE_GRID":
             comment = ("价格偏离区间假设,需复盘" if abs(c) >= 0.5
@@ -725,6 +728,12 @@ class KimiBrain:
                     "SELECT ts, action, confidence, outcome_status,"
                     " market_context, tool_arguments FROM decision_events"
                     " WHERE llm_model = ? AND symbol = ?"
+                    # skip subagent smoke-test rows (fake ref_prices made
+                    # absurd verdicts) and dry-run records
+                    " AND (evidence IS NULL"
+                    "      OR lower(evidence) NOT LIKE '%smoke test%')"
+                    " AND (market_context IS NULL"
+                    "      OR market_context NOT LIKE '%\"dry_run\": true%')"
                     " ORDER BY ts DESC LIMIT 1",
                     (LLM_MODEL_TAG, sym),
                 ).fetchone()

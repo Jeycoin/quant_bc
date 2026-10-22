@@ -531,14 +531,18 @@ def test_ref_price_recorded_in_market_context(tmp_path):
 
 def _seed_kimi_decision(analytics, symbol, action, *, side=None,
                         outcome="RECORDED", ref_price=None, age_s=1800,
-                        thesis="t" * 200, invalidation="i" * 200):
+                        thesis="t" * 200, invalidation="i" * 200,
+                        evidence=None, dry_run=False):
     mc = {"thesis": thesis, "invalidation": invalidation}
     if ref_price is not None:
         mc["ref_price"] = ref_price
+    if dry_run:
+        mc["dry_run"] = True
     ta = {"executor_config": {"side": side}} if side else None
     analytics.record_decision_event(
         mode="PAPER", symbol=symbol, action=action, outcome_status=outcome,
-        market_context=mc, tool_arguments=ta, llm_model="kimi-code",
+        market_context=mc, tool_arguments=ta, evidence=evidence,
+        llm_model="kimi-code",
         ts=time.time() - age_s)
 
 
@@ -596,6 +600,42 @@ def test_follow_up_ignores_other_models(tmp_path):
         mode="PAPER", symbol="BTC", action="SCAN", llm_model="glm-4.6",
         ts=1_800_000_000.0)
     assert brain._follow_up(["BTC"], {"BTC": {"price": 1.0}}, {}) == {}
+
+
+def test_follow_up_skips_smoke_evidence(tmp_path):
+    brain = _make_brain(tmp_path)
+    _seed_kimi_decision(brain.analytics, "ETH", "WAIT", ref_price=1900.0,
+                        age_s=60, evidence="batch smoke test")
+    _seed_kimi_decision(brain.analytics, "ETH", "WATCH", ref_price=1850.0,
+                        age_s=3600, evidence="legit cycle decision")
+    fu = brain._follow_up(["ETH"], {"ETH": {"price": 1860.0}}, {})
+    # the newer smoke row (ref 1900) is skipped; the legit older row wins
+    assert fu["ETH"]["ref_price"] == 1850.0
+    assert fu["ETH"]["action"] == "WATCH"
+
+
+def test_follow_up_skips_dry_run_rows(tmp_path):
+    brain = _make_brain(tmp_path)
+    _seed_kimi_decision(brain.analytics, "SOL", "PROPOSE_GRID",
+                        outcome="RECORDED", ref_price=100.0, age_s=60,
+                        evidence="plausible-looking", dry_run=True)
+    fu = brain._follow_up(["SOL"], {"SOL": {"price": 101.0}}, {})
+    # only a dry-run row exists -> no follow-up at all for the symbol
+    assert "SOL" not in fu
+
+
+def test_follow_up_wait_direction_aware(tmp_path):
+    brain = _make_brain(tmp_path)
+    # price dropped after WAIT -> the caution was correct
+    _seed_kimi_decision(brain.analytics, "BTC", "WAIT", ref_price=100.0)
+    fu = brain._follow_up(["BTC"], {"BTC": {"price": 99.5}}, {})
+    assert "观望正确" in fu["BTC"]["verdict"]
+    assert "规避下跌" in fu["BTC"]["verdict"]
+    # price rose after WATCH -> opportunity cost
+    _seed_kimi_decision(brain.analytics, "ETH", "WATCH", ref_price=100.0)
+    fu = brain._follow_up(["ETH"], {"ETH": {"price": 100.5}}, {})
+    assert "错过反弹" in fu["ETH"]["verdict"]
+    assert "复核是否该更积极" in fu["ETH"]["verdict"]
 
 
 # -------------------------------------------------------------------- batch
