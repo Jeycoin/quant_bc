@@ -35,13 +35,15 @@ python scripts/kimi_brain.py execute decision.json
  "action": "WAIT | WATCH | PROPOSE_GRID | PROPOSE_POSITION",
  "regime": "TRENDING_BEAR", "strategy": "none",
  "confidence": 0.7,
- "evidence": "一句话证据",
+ "evidence": "一句话证据(字符串或字符串数组)",
  "thesis": "命题(PROPOSE_* 必填)", "invalidation": "证伪条件(PROPOSE_POSITION 必填)",
+ "ref_price": 81782.0,
  "gate_adjustments": {"entry_gate.rsi_overbought": {"value": 80, "reason": "..."}},
  "executor_config": {"side": "LONG", "amount_quote": 200,
                      "take_profit": 0.02, "stop_loss": 0.01}}
 ```
 
+- `ref_price`(可选,v1.5.1):写决策时的当前价,正数。落进 market_context,驱动下一周期 context 的 `follow_up` 跟踪(见下)。**建议每个决策都填**——不填则该币种 follow_up 只能报"无法跟踪"。
 - `executor_config` 缺省补全:`connector_name=binance_perpetual_testnet`(env `EXECUTOR_CONNECTOR` 可改)、`trading_pair=<symbol>-USDT`、`type` 按 action 推导。显式字段永远优先。
 - grid 的 `keep_position` 强制 false(v1.4.1 红线,与旧环一致)。
 - position 的 top-level tp/sl/time_limit 自动并入 `triple_barrier_config`,`amount_quote` 按现价折成 base `amount`(沿用 v1.4.2 归一化)。
@@ -55,7 +57,9 @@ python scripts/kimi_brain.py execute decision.json
 | `portfolio` | `/portfolio/state` + `/trading/positions` | equity、余额、持仓含浮动盈亏(三笔遗留:XRP 415.0、BTC 0.0012、SOL 2.67,binance_perpetual_testnet) |
 | `active_executors` | `search_executors(RUNNING)` | id/类型/交易对/方向/金额/pnl |
 | `intelligence` | `intelligence.snapshot.build_snapshot` | 与旧 LLM 环相同的 for_llm 快照 |
-| `memory` | `agent._memory_context()` | 近期判断/已平仓/track record/lessons |
+| `data_quality` | `assess_data_quality(intel)`(v1.5.1) | 时效告警:只列**超时/缺失**的段。阈值 fear_greed 360min、news 720、onchain 720、derivatives 60、narratives 120;全新鲜则 `"stale": []` |
+| `follow_up` | decision_events 中每币种最新 kimi-code 决策(v1.5.1) | 上周期的 thesis/invalidation(截 120 字)+ ref_price vs 现价 + 规则化 verdict(横盘/被验证/被证伪需复盘);有持仓则附 `open_position_pnl` |
+| `memory` | `agent._memory_context()` + 交易拆分(v1.5.1) | recent_calls/lessons 沿用旧逻辑;`recent_trades` 每条带 `src: "live"|"replay"` 标签,`track_record` 拆成 `live`/`replay` 两个子块(replay = executor_id `bt-*` 或 close_type `REPLAY_END`);live 样本为 0 时显式 `{"trades": 0}` |
 | `gates.tunable` | `tunable_spec()` | 23 旋钮 default/min/max |
 | `gates.protections` | `evaluate_protections()` | 当前全局锁/币种锁/剩余时间 |
 | `gates.grid_state` | 公共 1h K 线 + `evaluate_grid_state` | 见下文"差异 4" |
@@ -96,3 +100,12 @@ python scripts/kimi_brain.py execute decision.json
 - `scripts/kimi_brain.py` — 全部新代码(context/execute/验证接线/落库)
 - `tests/test_kimi_brain.py` — 21 个测试
 - 未改动:六道门控、agent_loop.py、analytics schema、历史数据
+
+## v1.5.1 更新(2026-10-22,大脑两个真实周期后的四个痛点)
+
+1. **记忆污染修复**:`memory` 段的 recent_trades/track_record 曾混入 2700+ 条回放交易(bt-* executor_id),把真实战绩淹没。现在每条交易带 `src` 标签,track_record 拆 live/replay;分类规则 = executor_id `bt-*` 或 close_type `REPLAY_END` 归 replay,其余归 live。实测:BTC live 显式 `{"trades": 0}`,replay 20 条 win_rate 0.45。
+2. **数据时效告警**:新增 `data_quality` 段。实测首个输出即抓到大痛点原样:fear_greed 590.9min(阈值 360)、onchain.BTC.network_activity 2030.9min(阈值 720)、social.symbols 与 4 个币种的 onchain 缺失。
+3. **决策跟踪**:schema 加 `ref_price`(可选,正数,经 `_record` 落 market_context);context 新增 `follow_up` 段。verdict 规则:WAIT/WATCH |Δ|<0.3% 横盘、≥0.5% 波动放大;方向单同向 >0.5% 被验证、反向 >0.5% 被证伪需复盘(未成交加后缀);grid |Δ|≥0.5% 偏离区间假设;持仓附浮动盈亏。注意:**历史决策没有 ref_price,首次升级后需要大脑开始填写才有跟踪**(旧决策优雅降级为"无法跟踪")。
+4. **批量决策**:首版已支持(`load_decisions` 接受单对象/数组/`{"decisions":[...]}`),本版补上 `execute_all` 方法、CLI 改走它、批量冒烟与单测。单对象格式完全向后兼容。
+
+验证:13 个新测试,全套 **191 passed**;context 实跑 23.2KB 含全部新段;批量 dry-run 实跑通过。

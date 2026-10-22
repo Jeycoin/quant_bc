@@ -25,6 +25,9 @@ Decision file schema (single object, a list, or {"decisions": [...]}):
      "regime": "TRENDING_BULL|...", "strategy": "grid|position|none",
      "confidence": 0.0-1.0, "evidence": "one sentence",
      "thesis": "...", "invalidation": "...",       # required for PROPOSE_POSITION
+     "ref_price": 81782.0,                          # optional: price at decision
+                                                    # time, powers the follow_up
+                                                    # tracking in the next context
      "gate_adjustments": {"entry_gate.rsi_overbought": {"value": 80, "reason": "..."}},
      "executor_config": {"connector_name": "binance_perpetual_testnet",
                          "trading_pair": "BTC-USDT", ...}}   # required for PROPOSE_*
@@ -164,6 +167,10 @@ def validate_decision(d: dict[str, Any]) -> list[str]:
     ga = d.get("gate_adjustments")
     if ga is not None and not isinstance(ga, dict):
         errors.append("gate_adjustments must be an object")
+    rp = d.get("ref_price")
+    if rp is not None and (not isinstance(rp, (int, float))
+                           or isinstance(rp, bool) or float(rp) <= 0):
+        errors.append(f"ref_price must be a positive number, got {rp!r}")
     if action in ("PROPOSE_GRID", "PROPOSE_POSITION"):
         cfg = d.get("executor_config")
         if isinstance(cfg, str):
@@ -175,6 +182,92 @@ def validate_decision(d: dict[str, Any]) -> list[str]:
         if action == "PROPOSE_POSITION" and not d.get("invalidation"):
             errors.append("PROPOSE_POSITION requires an invalidation condition")
     return errors
+
+
+# ------------------------------------------------------------ data quality
+
+# Per-section staleness thresholds (minutes). Only sections whose freshest
+# data is older than the threshold (or absent) are reported.
+DATA_QUALITY_THRESHOLDS = {
+    "fear_greed": 360,
+    "news": 720,
+    "onchain": 720,
+    "derivatives": 60,
+    "narratives": 120,
+}
+
+
+def assess_data_quality(intel: dict[str, Any] | None) -> dict[str, Any]:
+    """Staleness/missing report over the intelligence snapshot.
+
+    Same shape for fresh and stale data is the trap this guards against:
+    a 9-minute-old OI and a 33-hour-old network-activity print look
+    identical in the JSON unless someone checks age_minutes.
+    """
+    stale: list[dict[str, Any]] = []
+    missing: list[str] = []
+
+    def _check(section: str, age: Any, threshold: int) -> None:
+        if age is None:
+            missing.append(section)
+        elif float(age) > threshold:
+            stale.append({"section": section,
+                          "age_minutes": round(float(age), 1),
+                          "threshold": threshold})
+
+    if not isinstance(intel, dict) or not intel:
+        return {"stale": [], "missing": ["intelligence.*"]}
+
+    social = intel.get("social") or {}
+    market = social.get("market") or {}
+    _check("social.fear_greed",
+           (market.get("fear_greed") or {}).get("age_minutes"),
+           DATA_QUALITY_THRESHOLDS["fear_greed"])
+    sym_social = social.get("symbols") or {}
+    if not any(sym_social.get(s) for s in sym_social):
+        missing.append("social.symbols.*")
+
+    onchain = intel.get("onchain") or {}
+    if not onchain:
+        missing.append("onchain.*")
+    else:
+        for sym, feats in onchain.items():
+            if not feats:
+                missing.append(f"onchain.{sym}.*")
+                continue
+            for name, item in feats.items():
+                _check(f"onchain.{sym}.{name}",
+                       (item or {}).get("age_minutes"),
+                       DATA_QUALITY_THRESHOLDS["onchain"])
+
+    derivs = intel.get("derivatives") or {}
+    if not derivs:
+        missing.append("derivatives.*")
+    for sym, feats in derivs.items():
+        for name in ("open_interest", "funding_rate"):
+            _check(f"derivatives.{sym}.{name}",
+                   ((feats or {}).get(name) or {}).get("age_minutes"),
+                   DATA_QUALITY_THRESHOLDS["derivatives"])
+
+    news = intel.get("news") or []
+    if not news:
+        missing.append("news")
+    else:
+        ages = [n.get("age_minutes") for n in news
+                if n.get("age_minutes") is not None]
+        _check("news(newest)", min(ages) if ages else None,
+               DATA_QUALITY_THRESHOLDS["news"])
+
+    narratives = intel.get("narratives") or []
+    if not narratives:
+        missing.append("narratives")
+    else:
+        ages = [n.get("age_minutes") for n in narratives
+                if n.get("age_minutes") is not None]
+        _check("narratives(newest)", min(ages) if ages else None,
+               DATA_QUALITY_THRESHOLDS["narratives"])
+
+    return {"stale": stale, "missing": missing}
 
 
 # ------------------------------------------------------- executor pipeline
@@ -351,6 +444,8 @@ class KimiBrain:
             market_ctx["thesis"] = decision["thesis"]
         if decision.get("invalidation"):
             market_ctx["invalidation"] = decision["invalidation"]
+        if decision.get("ref_price") is not None:
+            market_ctx["ref_price"] = decision["ref_price"]
         if gate_report and (gate_report["events"] or gate_report["rejected"]):
             market_ctx["applied_gate_adjustments"] = gate_report
         if dry_run:
@@ -495,6 +590,181 @@ class KimiBrain:
                 "create_response": response,
                 "gate_adjustments": gate_report}
 
+    async def execute_all(self, decisions: list[dict[str, Any]],
+                          dry_run: bool = False) -> list[dict[str, Any]]:
+        """Batch entry point: one command processes every symbol's decision
+        (single-object files are normalized to a 1-element list upstream,
+        so the old single-decision format keeps working)."""
+        results = []
+        for decision in decisions:
+            results.append(await self.execute_decision(
+                decision, dry_run=dry_run))
+        return results
+
+    # -- context helpers: live/replay trade split --
+
+    def _classified_trades(self, symbol: str,
+                           limit: int = 40) -> list[dict[str, Any]]:
+        """Closed trades for a symbol with a live/replay tag.
+
+        Replay rows are identified by executor_id 'bt-*' or close_type
+        REPLAY_END (replay also uses regular close types like STOP_LOSS,
+        so close_type alone is not enough). The brain's track record must
+        be built on LIVE fills only; replay rows stay visible but tagged.
+        """
+        if self.analytics is None:
+            return []
+        try:
+            rows = self.analytics._conn.execute(
+                "SELECT side, close_type, pnl_quote, ts_close, executor_id"
+                " FROM trade_events WHERE symbol = ? AND status = 'CLOSED'"
+                " AND ts_close IS NOT NULL ORDER BY ts_close DESC LIMIT ?",
+                (symbol, limit),
+            ).fetchall()
+        except Exception:
+            return []
+        now = time.time()
+        out = []
+        for side, close_type, pnl, ts_close, exid in rows:
+            src = ("replay" if (str(exid or "").startswith("bt-")
+                                or close_type == "REPLAY_END") else "live")
+            out.append({
+                "side": side, "close": close_type,
+                "pnl": round(pnl, 2) if pnl is not None else None,
+                "age_h": round((now - ts_close) / 3600, 1), "src": src,
+            })
+        return out
+
+    @staticmethod
+    def _split_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
+        """track_record split into live/replay sub-records. An empty live
+        sample is stated explicitly ({\"trades\": 0}) — never hidden."""
+        def stats(sub: list[dict[str, Any]]) -> dict[str, Any]:
+            pnls = [t["pnl"] for t in sub if t["pnl"] is not None]
+            if not pnls:
+                return {"trades": 0}
+            out: dict[str, Any] = {"trades": len(pnls),
+                                   "total_pnl": round(sum(pnls), 2)}
+            if len(pnls) < 3:
+                out["note"] = "sample too small for win rate"
+                return out
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
+            out.update({
+                "win_rate": round(len(wins) / len(pnls), 2),
+                "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+                "avg_loss": (round(sum(losses) / len(losses), 2)
+                             if losses else None),
+            })
+            return out
+
+        live = [t for t in trades if t["src"] == "live"][:20]
+        replay = [t for t in trades if t["src"] == "replay"][:20]
+        return {"live": stats(live), "replay": stats(replay)}
+
+    def _apply_trade_split(self, entry: dict[str, Any], symbol: str) -> None:
+        trades = self._classified_trades(symbol)
+        entry["recent_trades"] = trades[:4]
+        entry["track_record"] = self._split_stats(trades)
+
+    # -- context helpers: decision follow-up --
+
+    @staticmethod
+    def _verdict(action: str, side: Any, change_pct: float | None,
+                 executed: bool) -> str:
+        """Rule-based one-liner on how the last decision aged."""
+        suffix = ""
+        if action.startswith("PROPOSE") and not executed:
+            suffix = "(未成交)"
+        if change_pct is None:
+            return f"无 ref_price 或现价,无法跟踪{suffix}"
+        c = change_pct
+        if action in ("WAIT", "WATCH"):
+            if abs(c) < 0.3:
+                comment = "横盘,判断暂未被证伪"
+            elif abs(c) >= 0.5:
+                comment = "波动放大,观望前提需重新评估"
+            else:
+                comment = "小幅波动,观望前提未明显变化"
+            return f"{action} 后价格 {c:+.2f}%({comment})"
+        if action == "PROPOSE_GRID":
+            comment = ("价格偏离区间假设,需复盘" if abs(c) >= 0.5
+                       else "区间假设暂成立")
+            return f"GRID 后价格 {c:+.2f}%({comment}){suffix}"
+        direction = {"LONG": 1, "BUY": 1, "1": 1,
+                     "SHORT": -1, "SELL": -1, "2": -1}.get(
+                         str(side or "").upper(), 0)
+        if direction == 0:
+            return f"价格 {c:+.2f}%(方向未知,无法判定){suffix}"
+        aligned = c * direction
+        if aligned > 0.5:
+            comment = "判断被验证"
+        elif aligned < -0.5:
+            comment = "判断被证伪,需复盘"
+        else:
+            comment = "横盘,暂未被证伪"
+        return f"{side} 后价格 {c:+.2f}%({comment}){suffix}"
+
+    def _follow_up(self, symbols: list[str],
+                   market_features: dict[str, Any],
+                   portfolio: dict[str, Any]) -> dict[str, Any]:
+        """How each symbol's latest kimi-code decision is holding up:
+        thesis/invalidation carried forward, price then vs now, and a
+        rule-based verdict. Open positions report unrealized PnL."""
+        if self.analytics is None:
+            return {}
+        positions: dict[str, Any] = {}
+        for p in (portfolio or {}).get("open_positions") or []:
+            sym = str(p.get("trading_pair") or "").partition("-")[0]
+            if sym:
+                positions[sym] = p
+        out: dict[str, Any] = {}
+        for sym in symbols:
+            try:
+                row = self.analytics._conn.execute(
+                    "SELECT ts, action, confidence, outcome_status,"
+                    " market_context, tool_arguments FROM decision_events"
+                    " WHERE llm_model = ? AND symbol = ?"
+                    " ORDER BY ts DESC LIMIT 1",
+                    (LLM_MODEL_TAG, sym),
+                ).fetchone()
+            except Exception:
+                row = None
+            if not row:
+                continue
+            ts, action, conf, outcome, mc_raw, ta_raw = row
+            try:
+                mc = json.loads(mc_raw or "{}")
+            except (json.JSONDecodeError, TypeError):
+                mc = {}
+            side = None
+            try:
+                ta = json.loads(ta_raw or "{}")
+                side = (ta.get("executor_config") or {}).get("side")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            ref_price = mc.get("ref_price")
+            price_now = (market_features.get(sym) or {}).get("price")
+            change_pct = (round((float(price_now) / float(ref_price) - 1) * 100, 2)
+                          if ref_price and price_now else None)
+            entry: dict[str, Any] = {
+                "age_min": round((time.time() - ts) / 60, 1),
+                "action": action, "conf": conf, "outcome": outcome,
+                "ref_price": ref_price, "price_now": price_now,
+                "change_pct": change_pct,
+                "verdict": self._verdict(action, side, change_pct,
+                                         outcome == "EXECUTED"),
+            }
+            if mc.get("thesis"):
+                entry["thesis"] = str(mc["thesis"])[:120]
+            if mc.get("invalidation"):
+                entry["invalidation"] = str(mc["invalidation"])[:120]
+            pos = positions.get(sym)
+            if pos is not None:
+                entry["open_position_pnl"] = pos.get("unrealized_pnl")
+            out[sym] = entry
+        return out
+
     # -- context --
 
     async def build_context(self) -> dict[str, Any]:
@@ -518,7 +788,12 @@ class KimiBrain:
         except Exception as exc:
             executors = {"error": str(exc)[:200]}
         intel = await agent._intel_context()
-        memory_ctx = await agent._memory_context()
+        memory_ctx = await agent._memory_context() or {}
+        # live/replay split: the shared _memory_context mixes replay fills
+        # into recent_trades/track_record — re-tag and split them so the
+        # brain sees real live performance (pain point: memory pollution)
+        for sym in symbols:
+            self._apply_trade_split(memory_ctx.setdefault(sym, {}), sym)
 
         prot = None
         if self.analytics is not None:
@@ -557,6 +832,9 @@ class KimiBrain:
             "portfolio": portfolio,
             "active_executors": executors,
             "intelligence": intel,
+            "data_quality": assess_data_quality(intel),
+            "follow_up": self._follow_up(symbols, market_features or {},
+                                         portfolio),
             "memory": memory_ctx,
             "gates": {
                 "tunable": tunable_spec(self.guard.config),
@@ -649,11 +927,8 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
 
     guard, memory, analytics, agent = build_stacks()
     brain = KimiBrain(guard, memory, analytics, agent)
-    results = []
     try:
-        for decision in decisions:
-            results.append(await brain.execute_decision(
-                decision, dry_run=args.dry_run))
+        results = await brain.execute_all(decisions, dry_run=args.dry_run)
     finally:
         if analytics is not None:
             analytics.close()

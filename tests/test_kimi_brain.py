@@ -10,6 +10,7 @@ the real gate methods are covered by their own test suites.
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -401,3 +402,214 @@ def test_execute_create_failure_records_rejection(tmp_path):
     assert row["outcome_status"] == "REJECTED"
     assert row["risk_status"] == "EXECUTION_ERROR"
     assert "API unreachable" in row["rejection_reason"]
+
+
+# ------------------------------------------------------------ data quality
+
+
+def test_data_quality_flags_stale_and_missing():
+    intel = {
+        "social": {
+            "market": {"fear_greed": {"value": 68, "age_minutes": 551.0}},
+            "symbols": {"BTC": {}, "ETH": {}},
+        },
+        "onchain": {
+            "BTC": {"network_activity": {"value": 1, "age_minutes": 1978.0}},
+            "ETH": {},
+        },
+        "derivatives": {
+            "BTC": {"open_interest": {"value": 1, "age_minutes": 9.0},
+                    "funding_rate": {"value": 0.1, "age_minutes": 9.0}},
+        },
+        "news": [{"title": "x", "age_minutes": 30.0}],
+        "narratives": [],
+    }
+    q = kimi_brain.assess_data_quality(intel)
+    stale_sections = {s["section"] for s in q["stale"]}
+    assert "social.fear_greed" in stale_sections
+    assert "onchain.BTC.network_activity" in stale_sections
+    fg = next(s for s in q["stale"] if s["section"] == "social.fear_greed")
+    assert fg["age_minutes"] == 551.0 and fg["threshold"] == 360
+    # fresh derivatives and news are NOT flagged
+    assert not any(s.startswith("derivatives") for s in stale_sections)
+    assert not any(s.startswith("news") for s in stale_sections)
+    assert "social.symbols.*" in q["missing"]
+    assert "onchain.ETH.*" in q["missing"]
+    assert "narratives" in q["missing"]
+
+
+def test_data_quality_all_fresh_is_quiet():
+    intel = {
+        "social": {"market": {"fear_greed": {"value": 50, "age_minutes": 30}},
+                   "symbols": {"BTC": {"sentiment": {"age_minutes": 20}}}},
+        "onchain": {"BTC": {"network_activity": {"age_minutes": 100}}},
+        "derivatives": {"BTC": {"open_interest": {"age_minutes": 5},
+                                "funding_rate": {"age_minutes": 5}}},
+        "news": [{"age_minutes": 10}],
+        "narratives": [{"name": "n", "age_minutes": 30}],
+    }
+    q = kimi_brain.assess_data_quality(intel)
+    assert q["stale"] == []
+    assert q["missing"] == []
+
+
+def test_data_quality_no_intel():
+    q = kimi_brain.assess_data_quality(None)
+    assert q == {"stale": [], "missing": ["intelligence.*"]}
+
+
+# ------------------------------------------------------- live/replay split
+
+
+def _seed_trades(analytics):
+    # live fills (real executor ids)
+    analytics.upsert_trade_event(
+        executor_id="4LElive1", symbol="BTC", side="LONG", status="CLOSED",
+        close_type="STOP_LOSS", pnl_quote=-5.0, ts_close=1_000.0)
+    analytics.upsert_trade_event(
+        executor_id="4LElive2", symbol="BTC", side="LONG", status="CLOSED",
+        close_type="TAKE_PROFIT", pnl_quote=8.0, ts_close=2_000.0)
+    # replay fills (bt-* ids; replay also uses regular close types)
+    for i, pnl in enumerate((-1.0, 2.0, -3.0, 1.5)):
+        analytics.upsert_trade_event(
+            executor_id=f"bt-replay{i}", symbol="BTC", side="SHORT",
+            status="CLOSED", close_type="STOP_LOSS", pnl_quote=pnl,
+            ts_close=3_000.0 + i)
+    analytics.upsert_trade_event(
+        executor_id="bt-replayX", symbol="BTC", side="LONG", status="CLOSED",
+        close_type="REPLAY_END", pnl_quote=0.5, ts_close=4_000.0)
+
+
+def test_trade_split_tags_and_separates(tmp_path):
+    brain = _make_brain(tmp_path)
+    _seed_trades(brain.analytics)
+    entry = {}
+    brain._apply_trade_split(entry, "BTC")
+    recent = entry["recent_trades"]
+    assert recent and all("src" in t for t in recent)
+    assert recent[0]["src"] == "replay"  # newest is the REPLAY_END row
+    tr = entry["track_record"]
+    assert tr["live"]["trades"] == 2
+    assert tr["live"]["total_pnl"] == 3.0
+    assert tr["live"]["note"]  # < 3 live trades: no fake win rate
+    assert "win_rate" not in tr["live"]
+    assert tr["replay"]["trades"] == 5
+    assert tr["replay"]["win_rate"] == 0.6
+
+
+def test_trade_split_zero_live_is_explicit(tmp_path):
+    brain = _make_brain(tmp_path)
+    analytics = brain.analytics
+    analytics.upsert_trade_event(
+        executor_id="bt-only", symbol="ETH", side="LONG", status="CLOSED",
+        close_type="REPLAY_END", pnl_quote=1.0, ts_close=1_000.0)
+    entry = {}
+    brain._apply_trade_split(entry, "ETH")
+    assert entry["track_record"]["live"] == {"trades": 0}
+    assert entry["track_record"]["replay"]["trades"] == 1
+
+
+# ---------------------------------------------------------------- follow-up
+
+
+def test_ref_price_schema_validation():
+    assert validate_decision({"symbol": "BTC", "action": "WAIT",
+                              "ref_price": 81782.0}) == []
+    errors = validate_decision({"symbol": "BTC", "action": "WAIT",
+                                "ref_price": -5})
+    assert any("ref_price" in e for e in errors)
+
+
+def test_ref_price_recorded_in_market_context(tmp_path):
+    brain = _make_brain(tmp_path)
+    result = _run(brain.execute_decision(
+        {"symbol": "BTC", "action": "WAIT", "ref_price": 81782.0},
+        dry_run=True))
+    row = brain.analytics.get_decision_event(result["decision_id"])
+    assert json.loads(row["market_context"])["ref_price"] == 81782.0
+
+
+def _seed_kimi_decision(analytics, symbol, action, *, side=None,
+                        outcome="RECORDED", ref_price=None, age_s=1800,
+                        thesis="t" * 200, invalidation="i" * 200):
+    mc = {"thesis": thesis, "invalidation": invalidation}
+    if ref_price is not None:
+        mc["ref_price"] = ref_price
+    ta = {"executor_config": {"side": side}} if side else None
+    analytics.record_decision_event(
+        mode="PAPER", symbol=symbol, action=action, outcome_status=outcome,
+        market_context=mc, tool_arguments=ta, llm_model="kimi-code",
+        ts=time.time() - age_s)
+
+
+def test_follow_up_wait_flat_market(tmp_path):
+    brain = _make_brain(tmp_path)
+    _seed_kimi_decision(brain.analytics, "BTC", "WAIT", ref_price=81800.0)
+    fu = brain._follow_up(["BTC"], {"BTC": {"price": 81770.0}}, {})
+    e = fu["BTC"]
+    assert e["change_pct"] == -0.04
+    assert "横盘" in e["verdict"] and "暂未被证伪" in e["verdict"]
+    assert e["thesis"] == "t" * 120  # truncated
+    assert e["invalidation"] == "i" * 120
+    assert e["age_min"] == 30.0
+
+
+def test_follow_up_directional_verdicts(tmp_path):
+    brain = _make_brain(tmp_path)
+    # LONG that went the right way -> validated
+    _seed_kimi_decision(brain.analytics, "BTC", "PROPOSE_POSITION",
+                        side="LONG", outcome="EXECUTED", ref_price=80000.0)
+    fu = brain._follow_up(["BTC"], {"BTC": {"price": 80500.0}}, {})
+    assert "判断被验证" in fu["BTC"]["verdict"]
+    # SHORT that went against -> falsified, not executed -> suffix
+    _seed_kimi_decision(brain.analytics, "ETH", "PROPOSE_POSITION",
+                        side="SHORT", outcome="REJECTED", ref_price=3000.0)
+    fu = brain._follow_up(["ETH"], {"ETH": {"price": 3030.0}}, {})
+    assert "判断被证伪" in fu["ETH"]["verdict"]
+    assert "(未成交)" in fu["ETH"]["verdict"]
+
+
+def test_follow_up_grid_and_no_ref_price(tmp_path):
+    brain = _make_brain(tmp_path)
+    _seed_kimi_decision(brain.analytics, "SOL", "PROPOSE_GRID",
+                        outcome="EXECUTED", ref_price=100.0)
+    fu = brain._follow_up(["SOL"], {"SOL": {"price": 100.2}}, {})
+    assert "区间假设暂成立" in fu["SOL"]["verdict"]
+    _seed_kimi_decision(brain.analytics, "XRP", "WAIT")  # no ref_price
+    fu = brain._follow_up(["XRP"], {"XRP": {"price": 1.3}}, {})
+    assert "无法跟踪" in fu["XRP"]["verdict"]
+
+
+def test_follow_up_reports_open_position_pnl(tmp_path):
+    brain = _make_brain(tmp_path)
+    _seed_kimi_decision(brain.analytics, "BTC", "WAIT", ref_price=84000.0)
+    portfolio = {"open_positions": [
+        {"trading_pair": "BTC-USDT", "amount": 0.0012,
+         "unrealized_pnl": -2.54}]}
+    fu = brain._follow_up(["BTC"], {"BTC": {"price": 81770.0}}, portfolio)
+    assert fu["BTC"]["open_position_pnl"] == -2.54
+
+
+def test_follow_up_ignores_other_models(tmp_path):
+    brain = _make_brain(tmp_path)
+    brain.analytics.record_decision_event(
+        mode="PAPER", symbol="BTC", action="SCAN", llm_model="glm-4.6",
+        ts=1_800_000_000.0)
+    assert brain._follow_up(["BTC"], {"BTC": {"price": 1.0}}, {}) == {}
+
+
+# -------------------------------------------------------------------- batch
+
+
+def test_execute_all_processes_every_decision(tmp_path):
+    brain = _make_brain(tmp_path)
+    results = _run(brain.execute_all([
+        {"symbol": "BTC", "action": "WAIT", "ref_price": 81800.0},
+        {"symbol": "ETH", "action": "WATCH"},
+        {"symbol": "SOL", "action": "WAIT"},
+    ], dry_run=True))
+    assert [r["outcome"] for r in results] == ["RECORDED"] * 3
+    assert len({r["decision_id"] for r in results}) == 3
+    rows = [brain.analytics.get_decision_event(r["decision_id"])
+            for r in results]
+    assert all(row["outcome_status"] == "RECORDED" for row in rows)
