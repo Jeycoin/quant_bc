@@ -773,11 +773,19 @@ class KimiBrain:
                    .get("allowed_base_assets", ["BTC", "ETH"])
                    if not s.startswith("U")]
 
-        market_features = await agent._market_features_context()
-        if not market_features:
-            # one retry: a single hiccup on any symbol's fetch aborts the
-            # whole pass (agent.py wraps the loop in one try/except)
-            market_features = await agent._market_features_context()
+        mf_errors: dict[str, str] = {}
+        market_features = await agent._market_features_context(
+            errors=mf_errors) or {}
+        missing = [s for s in symbols if s not in market_features]
+        if missing:
+            # one retry for the missing set: transient single-venue hiccups
+            # usually clear immediately; successes from pass 1 are kept
+            retry = await agent._market_features_context(
+                errors=mf_errors) or {}
+            for sym, feats in retry.items():
+                market_features.setdefault(sym, feats)
+            missing = [s for s in symbols if s not in market_features]
+        market_features = market_features or None
         portfolio = {}
         try:
             portfolio = await agent._snapshot_portfolio()
@@ -829,6 +837,12 @@ class KimiBrain:
             },
             "symbols": symbols,
             "market_features": market_features,
+            # outage visibility for the brain: [] / {} = all symbols fine;
+            # a partial list = single-symbol fault (down-weight that symbol),
+            # all five = venue/collection outage (treat context as degraded)
+            "market_features_missing": missing,
+            "market_features_errors": {s: mf_errors[s] for s in missing
+                                       if s in mf_errors},
             "portfolio": portfolio,
             "active_executors": executors,
             "intelligence": intel,

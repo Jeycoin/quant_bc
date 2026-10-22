@@ -998,25 +998,47 @@ class TradingAgent:
         except Exception:
             return None
 
-    async def _market_features_context(self) -> dict[str, Any] | None:
+    async def _market_features_context(
+        self, errors: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
         """Fresh multi-horizon market features per symbol (short bars).
 
         Uses the same feature function as the historical replay so live
-        decisions and backtests see identical inputs. Best-effort: returns
-        None on any failure — the agent then relies on its MCP tools only.
-        """
-        try:
-            from agent.market_features import MIN_BARS, compute_market_features
+        decisions and backtests see identical inputs.
 
-            symbols = self.guard.config["safety"].get("allowed_base_assets",
-                                                      ["BTC", "ETH"])
-            symbols = [s for s in symbols if not s.startswith("U")]
-            bar = os.getenv("FEATURE_BAR", "30m")
+        Failure semantics (hardened after intermittent total-None outages):
+        per-symbol isolation — one symbol's fetch/parse/feature failure
+        costs only that symbol; None is returned only when EVERY symbol
+        failed. Every caught exception is logged to stderr (symbol, stage,
+        truncated message) and, when `errors` (an out-param dict) is
+        supplied, recorded as errors[symbol] = "stage: message" so callers
+        can tell a partial outage from a total one. Optional `errors`
+        keeps the original call signature intact.
+        """
+        from agent.market_features import MIN_BARS, compute_market_features
+
+        def _warn(sym: str, stage: str, exc: Any) -> None:
+            detail = str(exc) or type(exc).__name__
+            msg = f"{stage}: {detail[:150]}"
+            print(f"[warn] market_features {sym} {msg}", file=sys.stderr)
+            if errors is not None:
+                errors[sym] = msg
+
+        symbols = self.guard.config["safety"].get("allowed_base_assets",
+                                                  ["BTC", "ETH"])
+        symbols = [s for s in symbols if not s.startswith("U")]
+        bar = os.getenv("FEATURE_BAR", "30m")
+        try:
             derivs = await self._public_derivatives()
-            # fetch all symbols' candles first so cross-asset factors
-            # (BTC correlation / relative strength) can be computed
-            candles_by_sym: dict[str, list[dict]] = {}
-            for sym in symbols:
+        except Exception as exc:
+            _warn("*", "derivatives", exc)
+            derivs = {}
+        # fetch all symbols' candles first so cross-asset factors
+        # (BTC correlation / relative strength) can be computed
+        candles_by_sym: dict[str, list[dict]] = {}
+        for sym in symbols:
+            rows = None
+            try:
                 data = await self._hb_rest("POST", "/market-data/candles", {
                     "connector_name": os.getenv("MARKET_PROBE_CONNECTOR",
                                                 "hyperliquid_perpetual"),
@@ -1024,40 +1046,52 @@ class TradingAgent:
                     "interval": bar, "max_records": 400,
                 })
                 rows = data.get("candles", data) if isinstance(data, dict) else data
-                candles = []
-                for c in rows or []:
-                    try:
-                        ts = float(c["timestamp"])
-                        candles.append({
-                            "timestamp": ts / 1000 if ts > 1e12 else ts,
-                            "open": float(c["open"]), "high": float(c["high"]),
-                            "low": float(c["low"]), "close": float(c["close"]),
-                            "volume": float(c.get("volume", 0) or 0),
-                        })
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                candles.sort(key=lambda c: c["timestamp"])
-                if len(candles) < MIN_BARS:
-                    # the Hummingbot candles endpoint only serves what the
-                    # connector has collected live — fall back to the public
-                    # API (read-only market data, same venue) for full depth
+            except Exception as exc:
+                _warn(sym, "hb_candles", exc)
+            candles = []
+            for c in rows or []:
+                try:
+                    ts = float(c["timestamp"])
+                    candles.append({
+                        "timestamp": ts / 1000 if ts > 1e12 else ts,
+                        "open": float(c["open"]), "high": float(c["high"]),
+                        "low": float(c["low"]), "close": float(c["close"]),
+                        "volume": float(c.get("volume", 0) or 0),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+            candles.sort(key=lambda c: c["timestamp"])
+            if len(candles) < MIN_BARS:
+                # the Hummingbot candles endpoint only serves what the
+                # connector has collected live — fall back to the public
+                # API (read-only market data, same venue) for full depth
+                try:
                     candles = await self._public_candles(sym, bar)
-                candles_by_sym[sym] = candles
-            ref = candles_by_sym.get("BTC")
-            funding_hist = self._funding_history(symbols)
-            out: dict[str, Any] = {}
-            for sym in symbols:
-                candles = candles_by_sym[sym]
+                except Exception as exc:
+                    _warn(sym, "public_candles", exc)
+                    continue  # this symbol is lost; the rest proceed
+            candles_by_sym[sym] = candles
+        ref = candles_by_sym.get("BTC")
+        funding_hist = self._funding_history(symbols)
+        out: dict[str, Any] = {}
+        for sym in symbols:
+            candles = candles_by_sym.get(sym)
+            if not candles:
+                continue
+            try:
                 feats = compute_market_features(
                     candles,
                     funding_rate=(derivs.get(sym) or {}).get("funding"),
                     ref_candles=ref if sym != "BTC" else None,
                     funding_history=funding_hist.get(sym))
-                if feats:
-                    out[sym] = feats
-            return out or None
-        except Exception:
-            return None
+            except Exception as exc:
+                _warn(sym, "features", exc)
+                continue
+            if feats:
+                out[sym] = feats
+            else:
+                _warn(sym, "features", "insufficient history")
+        return out or None
 
     def _funding_history(self, symbols: list[str],
                          points: int = 21) -> dict[str, list[float]]:

@@ -613,3 +613,130 @@ def test_execute_all_processes_every_decision(tmp_path):
     rows = [brain.analytics.get_decision_event(r["decision_id"])
             for r in results]
     assert all(row["outcome_status"] == "RECORDED" for row in rows)
+
+
+# ----------------------------------------- market_features outage hardening
+
+
+def _synth_candles(n=60, start=1_700_000_000.0):
+    return [{"timestamp": start + i * 1800, "open": 100 + i * 0.1,
+             "high": 101 + i * 0.1, "low": 99 + i * 0.1,
+             "close": 100.5 + i * 0.1, "volume": 10 + i}
+            for i in range(n)]
+
+
+def _wire_feature_stubs(brain, failing=()):
+    """Stub the agent's market-data seams; symbols in `failing` raise on
+    the public-candle fallback (HB returns empty -> fallback is always
+    exercised)."""
+    agent = brain.agent
+
+    async def hb_rest(method, path, payload):
+        return {}  # no collected candles -> public fallback path
+
+    async def public_candles(coin, interval, hours=200):
+        if coin in failing:
+            raise RuntimeError(f"intermittent venue hiccup on {coin}")
+        return _synth_candles()
+
+    async def public_derivatives():
+        return {"BTC": {"funding": 0.0001}}
+
+    agent._hb_rest = hb_rest
+    agent._public_candles = public_candles
+    agent._public_derivatives = public_derivatives
+    return agent
+
+
+def test_features_single_symbol_failure_isolated(tmp_path, capsys):
+    brain = _make_brain(tmp_path)
+    agent = _wire_feature_stubs(brain, failing={"SOL"})
+    errors = {}
+    out = _run(agent._market_features_context(errors=errors))
+    assert out is not None
+    assert "SOL" not in out                      # the failed symbol is absent
+    assert set(out) == {"BTC", "ETH", "XRP", "SUI"}  # the rest survive
+    assert "public_candles" in errors["SOL"]
+    assert "intermittent" in errors["SOL"]
+    err = capsys.readouterr().err
+    assert "[warn] market_features SOL" in err
+    assert "public_candles" in err
+
+
+def test_features_all_fail_returns_none(tmp_path, capsys):
+    brain = _make_brain(tmp_path)
+    agent = _wire_feature_stubs(
+        brain, failing={"BTC", "ETH", "SOL", "XRP", "SUI"})
+    errors = {}
+    out = _run(agent._market_features_context(errors=errors))
+    assert out is None                            # total outage -> None
+    assert set(errors) == {"BTC", "ETH", "SOL", "XRP", "SUI"}
+    assert capsys.readouterr().err.count("[warn] market_features") >= 5
+
+
+def test_features_errors_param_optional(tmp_path):
+    brain = _make_brain(tmp_path)
+    agent = _wire_feature_stubs(brain, failing={"SOL"})
+    # legacy call shape (no errors argument) keeps working
+    out = _run(agent._market_features_context())
+    assert set(out) == {"BTC", "ETH", "XRP", "SUI"}
+
+
+def test_build_context_reports_missing_symbols(tmp_path):
+    brain = _make_brain(tmp_path)
+    agent = brain.agent
+
+    async def mf(errors=None):
+        if errors is not None:
+            errors["SOL"] = "public_candles: boom"
+        return {"BTC": {"price": 1.0}}
+
+    async def empty(*a, **kw):
+        return None
+
+    agent._market_features_context = mf
+    agent._snapshot_portfolio = empty
+    agent._intel_context = empty
+    agent._memory_context = empty
+
+    async def no_executors():
+        return []
+
+    async def no_grid(sym):
+        return None
+
+    brain.running_executors = no_executors
+    brain._context_grid_state = no_grid
+    ctx = _run(brain.build_context())
+    assert ctx["market_features"] == {"BTC": {"price": 1.0}}
+    assert ctx["market_features_missing"] == ["ETH", "SOL", "XRP", "SUI"]
+    assert ctx["market_features_errors"] == {"SOL": "public_candles: boom"}
+
+
+def test_build_context_full_house_reports_no_missing(tmp_path):
+    brain = _make_brain(tmp_path)
+    agent = brain.agent
+
+    async def mf(errors=None):
+        return {s: {"price": 1.0} for s in
+                ("BTC", "ETH", "SOL", "XRP", "SUI")}
+
+    async def empty(*a, **kw):
+        return None
+
+    agent._market_features_context = mf
+    agent._snapshot_portfolio = empty
+    agent._intel_context = empty
+    agent._memory_context = empty
+
+    async def no_executors():
+        return []
+
+    async def no_grid(sym):
+        return None
+
+    brain.running_executors = no_executors
+    brain._context_grid_state = no_grid
+    ctx = _run(brain.build_context())
+    assert ctx["market_features_missing"] == []
+    assert ctx["market_features_errors"] == {}
