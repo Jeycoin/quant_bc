@@ -328,6 +328,13 @@ class KimiBrain:
 
     # -- recording --
 
+    @staticmethod
+    def _evidence_text(decision: dict[str, Any]) -> Any:
+        evidence = decision.get("evidence")
+        if isinstance(evidence, (list, tuple)):
+            return "; ".join(str(e) for e in evidence)
+        return evidence
+
     def _record(self, decision: dict[str, Any], decision_id: str, *,
                 outcome_status: str, risk_status: str | None = None,
                 rejection_reason: str | None = None,
@@ -356,7 +363,7 @@ class KimiBrain:
             action=decision.get("action"),
             strategy=decision.get("strategy"),
             confidence=decision.get("confidence"),
-            evidence=decision.get("evidence"),
+            evidence=self._evidence_text(decision),
             risk_status=risk_status,
             tool_name="manage_executors" if tool_arguments else None,
             tool_arguments=tool_arguments,
@@ -386,7 +393,7 @@ class KimiBrain:
                 action=decision.get("action"),
                 strategy=decision.get("strategy"),
                 confidence=decision.get("confidence"),
-                evidence=decision.get("evidence"),
+                evidence=self._evidence_text(decision),
                 raw=json.dumps(decision, ensure_ascii=False),
             )
         except Exception as exc:
