@@ -42,6 +42,11 @@ from agent.validators import (
     validate_entry,
 )
 from agent.protections import evaluate_protections
+from agent.tunable import (
+    clamp_executor_knobs,
+    effective_config,
+    resolve_adjustments,
+)
 from analytics.store import AnalyticsStore, new_decision_id
 from analytics.versioning import current_versions
 from integrations.llm import create_llm_client
@@ -139,6 +144,9 @@ class TradingAgent:
         self._blocked = False
         self._market_snapshot: dict[str, Any] = {}
         self._intel_snapshot: dict[str, Any] | None = None
+        # v1.5: gate_adjustments applied during this run (clamped events +
+        # rejections), recorded into decision_events for audit.
+        self._last_gate_adjustments: dict[str, Any] | None = None
         # Set when a memory write fails — degraded mode: no new trades
         # (master prompt §28: never trade freely when memory is down).
         self._memory_broken = False
@@ -196,6 +204,7 @@ class TradingAgent:
         self._created_executors = []
         self._blocked = False
         self._market_snapshot = {}
+        self._last_gate_adjustments = None
         market_feats = await self._market_features_context()
         if market_feats:
             user_message += (
@@ -322,6 +331,9 @@ class TradingAgent:
             market_ctx = dict(self._market_snapshot)
             if self._intel_snapshot:
                 market_ctx["intelligence"] = self._intel_snapshot
+            if self._last_gate_adjustments:
+                market_ctx["applied_gate_adjustments"] = \
+                    self._last_gate_adjustments
             common = {
                 "mode": self.guard.mode,
                 "risk_status": risk_status,
@@ -453,6 +465,25 @@ class TradingAgent:
             # call see the same canonical config.
             if isinstance(cfg, dict) and "position" in etype:
                 await self._normalize_position_config(cfg)
+        # v1.5: gate_adjustments ride inside the manage_executors/create
+        # call (tool calls precede the final analysis blocks, so this is
+        # the only live surface where adjustments can reach the gates of
+        # the SAME decision). Validate + clamp against the tunable table;
+        # the gates below evaluate with the effective per-decision config.
+        gate_report: dict[str, Any] = {"overrides": {}, "events": [],
+                                       "rejected": []}
+        gate_config = None
+        if name == "manage_executors" and arguments.get("action") == "create":
+            gate_report = resolve_adjustments(
+                arguments.pop("gate_adjustments", None), self.guard.config)
+            if gate_report["overrides"]:
+                gate_config = effective_config(self.guard.config,
+                                               gate_report["overrides"])
+            gate_report["events"] += clamp_executor_knobs(
+                cfg if isinstance(cfg, dict) else None, etype,
+                self.guard.config)
+            if gate_report["events"] or gate_report["rejected"]:
+                self._last_gate_adjustments = gate_report
         try:
             self.guard.check_tool_call(name, arguments)
             await self._check_position_capacity(name, arguments)
@@ -470,7 +501,8 @@ class TradingAgent:
             return f"SAFETY VIOLATION — call rejected: {exc}"
 
         if name == "manage_executors" and arguments.get("action") == "create":
-            rejection, stage = await self._validate_executor_create(arguments)
+            rejection, stage = await self._validate_executor_create(
+                arguments, gate_config=gate_config)
             if rejection:
                 self._blocked = True
                 self._safe_record(
@@ -482,7 +514,8 @@ class TradingAgent:
                     tool_arguments=arguments,
                     outcome=f"BLOCKED[{stage}]: {rejection}",
                 )
-                self._record_rejection(arguments, stage, rejection)
+                self._record_rejection(arguments, stage, rejection,
+                                       gate_report=gate_report)
                 return rejection
 
         result = await session.call_tool(name, arguments)
@@ -510,14 +543,18 @@ class TradingAgent:
         return text
 
     async def _validate_executor_create(
-        self, arguments: dict[str, Any]
+        self, arguments: dict[str, Any],
+        gate_config: dict[str, Any] | None = None,
     ) -> tuple[str | None, str | None]:
         """Deterministic gates before any executor is created.
 
         Order: protections -> grid protection -> entry gate -> cost -> risk.
         Returns (rejection_message, stage) or (None, None) when all gates
-        pass.
+        pass. `gate_config` is the per-decision effective config (defaults
+        + clamped gate_adjustments, v1.5); hard limits always come from
+        self.guard.config regardless.
         """
+        eff = gate_config or self.guard.config
         cfg = parse_executor_config(arguments)
         etype = str(arguments.get("executor_type") or cfg.get("type") or "")
         pair = str(cfg.get("trading_pair", ""))
@@ -535,7 +572,7 @@ class TradingAgent:
             try:
                 prot = evaluate_protections(
                     self.analytics.closed_trades(), time.time(),
-                    config=self.guard.config)
+                    config=eff)
                 locked = prot.blocks(symbol, side)
                 if locked:
                     return f"PROTECTION — REJECTED: {locked}", "PROTECTION"
@@ -545,7 +582,7 @@ class TradingAgent:
         # 1. Grid protection: objective candle features; blocks only on
         #    DEFENSIVE/EXIT (WARNING is logged via the rejection-free path).
         if "grid" in etype:
-            state = await self._grid_state(cfg)
+            state = await self._grid_state(cfg, config=eff)
             if state is not None and state.state in (GRID_DEFENSIVE, GRID_EXIT):
                 return (
                     f"GRID PROTECTION — {state.state}: {'; '.join(state.reasons)}. "
@@ -558,7 +595,7 @@ class TradingAgent:
         #     RSI guard). Fail-open when features are unavailable — the
         #     cost/risk gates below still apply.
         if "position" in etype:
-            gate = await self._entry_gate_check(cfg)
+            gate = await self._entry_gate_check(cfg, config=eff)
             if gate is not None and not gate.approved:
                 return (
                     "ENTRY GATE — REJECTED: " + "; ".join(gate.reasons),
@@ -595,7 +632,8 @@ class TradingAgent:
                 "RISK_REJECTED"
         return None, None
 
-    async def _entry_gate_check(self, cfg: dict[str, Any]):
+    async def _entry_gate_check(self, cfg: dict[str, Any],
+                                config: dict[str, Any] | None = None):
         """Entry gate for position executors: objective 30m market features
         for the target symbol, validated by agent.validators.validate_entry.
         The LLM's regime call is not available here (executor configs do not
@@ -640,11 +678,12 @@ class TradingAgent:
             if not features:
                 return None
             return validate_entry(features, action, regime=None,
-                                  config=self.guard.config)
+                                  config=config or self.guard.config)
         except Exception:
             return None
 
-    async def _grid_state(self, cfg: dict[str, Any]):
+    async def _grid_state(self, cfg: dict[str, Any],
+                          config: dict[str, Any] | None = None):
         """Evaluate the grid protection state from objective 1h candles.
 
         Market data comes from the hyperliquid probe connector (the only
@@ -672,7 +711,8 @@ class TradingAgent:
             features = compute_grid_features(candles)
             if not features:
                 return None
-            return evaluate_grid_state(features, config=self.guard.config)
+            return evaluate_grid_state(features,
+                                       config=config or self.guard.config)
         except Exception:
             return None
 
@@ -827,7 +867,8 @@ class TradingAgent:
             return None
 
     def _record_rejection(
-        self, arguments: dict[str, Any], stage: str, message: str
+        self, arguments: dict[str, Any], stage: str, message: str,
+        gate_report: dict[str, Any] | None = None,
     ) -> None:
         """Persist rejected proposals — rejected opportunities are a core
         analytics surface (Dashboard 'Rejected Opportunities')."""
@@ -837,6 +878,7 @@ class TradingAgent:
             cfg = parse_executor_config(arguments)
             etype = str(arguments.get("executor_type") or cfg.get("type") or "")
             experiment = self.analytics.get_active_experiment()
+            report = gate_report or self._last_gate_adjustments
             self.analytics.record_decision_event(
                 mode=self.guard.mode,
                 symbol=str(cfg.get("trading_pair", "")).partition("-")[0] or None,
@@ -847,6 +889,8 @@ class TradingAgent:
                 tool_arguments=arguments,
                 outcome_status="REJECTED",
                 rejection_reason=message[:500],
+                market_context=({"applied_gate_adjustments": report}
+                                if report else None),
                 llm_model=self.llm.model,
                 experiment_id=experiment["experiment_id"] if experiment else None,
                 **self.versions,

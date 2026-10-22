@@ -98,3 +98,50 @@ protections:
     min_trades: 4
     required_profit_quote: 0
     stop_duration_hours: 72
+
+# ---------------------------------------------------------------------------
+# Tunable gate parameters (v1.5): the ONLY knobs the AI may adjust, each
+# inside a hard-coded [min, max] envelope. Hard safety boundaries (safety:
+# section, risk: section ceilings, LIVE_TRADING switch) are NOT here and can
+# never be proposed by the AI. Mechanism: agent/tunable.py validates the
+# AI's gate_adjustments against this table, clamps out-of-range values
+# (clamp events are logged to decision_events), and the gates evaluate with
+# the effective per-decision parameter set. Scope is per-decision — global
+# changes still require a human edit of this file.
+#
+# Deviation note: the red-line range for grid take_profit was 0.5%-5%, but
+# current production grids run tp 0.1%-0.2% (both live executors and the
+# replay GRID_TP=0.002); a 0.5% floor would clamp every existing grid
+# config. The floor is therefore 0.1% — revisit when grid economics are
+# re-validated.
+tunable:
+  # --- entry gate thresholds (agent/validators.py validate_entry)
+  entry_gate.rsi_overbought: {default: 75, min: 65, max: 85}
+  entry_gate.rsi_oversold: {default: 25, min: 15, max: 35}
+  entry_gate.breakout_volume_z: {default: 1.0, min: 0.5, max: 2.5}
+  entry_gate.long_max_pos: {default: 0.6, min: 0.5, max: 0.8}
+  entry_gate.short_min_pos: {default: 0.4, min: 0.2, max: 0.5}
+  entry_gate.min_vol_ratio: {default: 0.7, min: 0.4, max: 1.0}
+  # --- trade window / cooldown
+  time_stop_hours: {default: 6, min: 2, max: 24}
+  protections.cooldown_stop_hours: {default: 6, min: 0, max: 12}
+  # --- executor barriers (clamped on executor configs)
+  grid_take_profit_pct: {default: 0.002, min: 0.001, max: 0.05}
+  grid_stop_loss_pct: {default: 0.02, min: 0.005, max: 0.05}
+  position_take_profit_pct: {default: 0.02, min: 0.005, max: 0.05}
+  position_stop_loss_pct: {default: 0.01, min: 0.005, max: 0.03}
+  # --- circuit breakers (risk.max_drawdown_pct=10 stays a hard ceiling,
+  #     this is only the protections-layer realized-PnL trip)
+  protections.stoploss_guard.trade_limit: {default: 4, min: 2, max: 8}
+  protections.max_drawdown.max_allowed_pct: {default: 3, min: 1, max: 6}
+  protections.low_profit_pairs.min_trades: {default: 4, min: 2, max: 10}
+  protections.low_profit_pairs.required_profit_quote: {default: 0, min: -5, max: 5}
+  # --- decision knobs
+  min_confidence: {default: 0.6, min: 0.5, max: 0.85}
+  leverage: {default: 1, min: 1, max: 20}
+  position_notional_quote: {default: 200, min: 50, max: 500}
+  # --- grid protection state machine thresholds
+  grid_protection.warn_trend_rise: {default: 1.25, min: 1.05, max: 2.0}
+  grid_protection.defensive_trend_strength: {default: 0.004, min: 0.002, max: 0.01}
+  grid_protection.warn_atr_rise: {default: 1.3, min: 1.05, max: 2.0}
+  grid_protection.breakout_atr_mult: {default: 0.5, min: 0.25, max: 1.5}

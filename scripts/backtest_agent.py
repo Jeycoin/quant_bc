@@ -54,6 +54,7 @@ load_dotenv(REPO_ROOT / ".env")
 from agent.agent import extract_analysis_blocks, normalize_regime
 from agent.market_features import compute_market_features
 from agent.protections import evaluate_protections
+from agent.tunable import effective_config, resolve_adjustments
 from agent.validators import (
     GRID_DEFENSIVE,
     GRID_EXIT,
@@ -105,7 +106,11 @@ high leverage can wipe out the margin on a modest adverse move. After a
 stop-out, the same direction on that symbol cools down for 6h. WAIT/WATCH
 does nothing. LONG and SHORT are fully symmetric in this replay — same
 costs, same barriers, both always available. Keep your confidence score
-honest — inflated confidence degrades the experiment. End your reply with
+honest — inflated confidence degrades the experiment. You may include
+per-decision gate_adjustments in an analysis block (see the Gate
+adjustments section of the system prompt): they are validated and
+clamped against the tunable table and apply only to that block's gate
+evaluation. End your reply with
 one ```analysis block per symbol.
 """
 
@@ -780,6 +785,17 @@ async def main() -> None:
             action = str(block.get("action") or "WAIT").upper()
             conf = float(block.get("confidence") or 0)
             price = px.get(sym) or summaries[sym]["price"]
+            # v1.5: per-decision gate adjustments proposed by the AI —
+            # validated + clamped against the tunable table, effective only
+            # for THIS block's gate evaluations (never persisted globally)
+            adj_report = resolve_adjustments(
+                block.get("gate_adjustments"), settings)
+            adj = adj_report["overrides"]
+            eff_settings = effective_config(settings, adj) if adj else settings
+            eff_prot_cfg = effective_config(prot_cfg, adj) if adj else prot_cfg
+            eff_min_conf = adj.get("min_confidence", args.min_confidence)
+            eff_time_stop_h = adj.get("time_stop_hours", args.time_stop_hours)
+            eff_grid_tp = adj.get("grid_take_profit_pct", args.grid_tp)
             if prefix:
                 # mirror the recorded outcome instead of re-validating, so the
                 # rebuild matches the original run even if config has drifted
@@ -822,13 +838,14 @@ async def main() -> None:
             sym_candles = _resample(
                 [c for c in candles[sym] if c["timestamp"] <= ts], bph)[-120:]
             grid_state = evaluate_grid_state(
-                compute_grid_features(sym_candles), regime=regime, config=settings)
+                compute_grid_features(sym_candles), regime=regime,
+                config=eff_settings)
 
             # v1.4: post-hoc circuit breakers over closed-trade outcomes
             # (cooldown / stoploss guard / drawdown / low-profit blacklist).
             # Evaluated per block — closes inside this same decision point
             # can escalate the lock for later blocks.
-            prot = evaluate_protections(closed_records, ts, config=prot_cfg)
+            prot = evaluate_protections(closed_records, ts, config=eff_prot_cfg)
 
             # deterministic execution policy — proposals pass through the
             # same cost/risk/protection gates as the live path (v0.4)
@@ -846,7 +863,7 @@ async def main() -> None:
                                  f"{summaries[sym]['adx_14bar']:.1f} > "
                                  f"{args.grid_adx_max:g}")
                 else:
-                    cost = cost_validator.validate_grid(args.grid_size, args.grid_tp,
+                    cost = cost_validator.validate_grid(args.grid_size, eff_grid_tp,
                                                         maker_entry=True, maker_exit=True)
                     if not cost.approved:
                         rejection = ("COST_REJECTED", cost.summary())
@@ -865,7 +882,7 @@ async def main() -> None:
                     grids[sym] = SimGrid(
                         GridSim(price * (1 - args.grid_range_pct),
                                 price * (1 + args.grid_range_pct),
-                                args.grid_size, tp=args.grid_tp),
+                                args.grid_size, tp=eff_grid_tp),
                         sym, ts, execution_id, regime)
                     cash -= args.grid_size
                     trade_count += 1
@@ -887,7 +904,7 @@ async def main() -> None:
                     fees_quote=g.sim.fees, gross_pnl=closed_pnl + g.sim.fees,
                     regime_at_entry=g.regime_at_entry,
                     source="agent", experiment_id=exp_id)
-            if action in ("LONG", "SHORT") and conf >= args.min_confidence \
+            if action in ("LONG", "SHORT") and conf >= eff_min_conf \
                     and not any(p.symbol == sym for p in positions):
                 # 0. cross-section gate (framework v0.6): LONG only for top-N
                 #    relative-strength candidates, SHORT only for the bottom
@@ -911,7 +928,7 @@ async def main() -> None:
                 if xs_reject:
                     risk_status, rejection_reason = "ENTRY_REJECTED", xs_reject
                 elif not (gate := validate_entry(summaries[sym], action, regime,
-                                                 config=settings)).approved:
+                                                 config=eff_settings)).approved:
                     risk_status = "ENTRY_REJECTED"
                     rejection_reason = "; ".join(gate.reasons)
                 elif prot_lock := prot.blocks(sym, action):
@@ -965,11 +982,14 @@ async def main() -> None:
                                     tp_pct=tp_eff, sl_pct=sl_eff,
                                     breakeven=not args.no_breakeven,
                                     trailing=not args.no_trailing,
-                                    time_stop_s=args.time_stop_hours * 3600,
+                                    time_stop_s=eff_time_stop_h * 3600,
                                     time_stop_mode=args.time_stop_mode))
                                 cash -= margin_eff
                                 trade_count += 1
 
+            mc_block = dict(context["markets"].get(sym) or {})
+            if adj_report["events"] or adj_report["rejected"]:
+                mc_block["applied_gate_adjustments"] = adj_report
             store.record_decision_event(
                 decision_id=decision_id if sym == SYMBOLS[0] else new_decision_id(),
                 ts=float(ts), mode="BACKTEST", symbol=sym, market_regime=regime,
@@ -977,7 +997,7 @@ async def main() -> None:
                 evidence=block.get("evidence"), risk_status=risk_status,
                 outcome_status="EXECUTED" if execution_id else
                 ("REJECTED" if rejection_reason else "RECORDED"),
-                execution_id=execution_id, market_context=context["markets"].get(sym),
+                execution_id=execution_id, market_context=mc_block,
                 portfolio_context=context["portfolio"], experiment_id=exp_id,
                 rejection_reason=rejection_reason,
                 llm_model=model_label,

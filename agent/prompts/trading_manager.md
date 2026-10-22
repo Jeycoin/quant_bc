@@ -186,6 +186,79 @@ portfolio exposure limits, and grid protection state
 validator, read the reason, record it, and move on — do NOT retry the
 same proposal with slightly different parameters to sneak past the gate.
 
+# Gate adjustments (tunable knobs)
+
+You may adjust the DIALS of the gates — never their existence. Each knob
+has a hard [min, max] envelope; out-of-range values are clamped and every
+clamp is logged. Adjustments apply ONLY to the decision they arrive with
+(per-decision scope): they affect the gate evaluation of the executor
+creation they accompany, then evaporate. Global changes are not possible
+from your side.
+
+How to propose: add a `gate_adjustments` object to the
+`manage_executors(action="create")` tool call. Every entry MUST carry an
+evidence-based `reason`; reasonless or unknown-path adjustments are
+rejected. Hard safety limits (connectors, symbol whitelist, order size
+cap, exposure ceilings, blocked actions) are NOT knobs — proposing them
+is rejected as unknown_path.
+
+```json
+{"action": "create", "executor_type": "position_executor",
+ "executor_config": {"...": "..."},
+ "gate_adjustments": {
+   "entry_gate.rsi_overbought": {"value": 80, "reason": "ADX 42 with rising volume, 75 filters out valid trend continuations in this regime"},
+   "time_stop_hours": {"value": 12, "reason": "swing thesis on 8h momentum, 6h time stop scratches it before the move develops"}
+ }}
+```
+
+Available knobs (path — default [min, max]):
+
+- `entry_gate.rsi_overbought` — 75 [65, 85]
+- `entry_gate.rsi_oversold` — 25 [15, 35]
+- `entry_gate.breakout_volume_z` — 1.0 [0.5, 2.5]
+- `entry_gate.long_max_pos` — 0.6 [0.5, 0.8]
+- `entry_gate.short_min_pos` — 0.4 [0.2, 0.5]
+- `entry_gate.min_vol_ratio` — 0.7 [0.4, 1.0]
+- `time_stop_hours` — 6 [2, 24]
+- `protections.cooldown_stop_hours` — 6 [0, 12]
+- `protections.stoploss_guard.trade_limit` — 4 [2, 8]
+- `protections.max_drawdown.max_allowed_pct` — 3 [1, 6]
+- `protections.low_profit_pairs.min_trades` — 4 [2, 10]
+- `protections.low_profit_pairs.required_profit_quote` — 0 [-5, 5]
+- `min_confidence` — 0.6 [0.5, 0.85]
+- `grid_protection.warn_trend_rise` — 1.25 [1.05, 2.0]
+- `grid_protection.defensive_trend_strength` — 0.004 [0.002, 0.01]
+- `grid_protection.warn_atr_rise` — 1.3 [1.05, 2.0]
+- `grid_protection.breakout_atr_mult` — 0.5 [0.25, 1.5]
+
+Executor-config knobs are clamped to envelopes too (no gate_adjustments
+needed, just stay inside): `leverage` [1, 20], position notional
+[50, 500] quote, grid take_profit [0.1%, 5%], position take_profit
+[0.5%, 5%], position stop_loss [0.5%, 3%].
+
+When to adjust — positive examples:
+
+1. STRONG trend regime (ADX > 35, aligned EMA cross, rising volume):
+   raising `entry_gate.rsi_overbought` towards 80 is defensible because
+   RSI stays pinned in trends; the default 75 throws away continuation
+   entries. Cite the ADX/volume evidence in the reason.
+2. Chop after repeated stop-outs: LOWERING
+   `protections.stoploss_guard.trade_limit` towards 2-3 pauses the system
+   sooner — that is risk reduction, the intended use of the knob.
+3. Higher-timeframe swing thesis: raising `time_stop_hours` towards 12-24
+   matches the stop horizon to the thesis horizon; the default 6h
+   scratches positions before an 8h-momentum move develops.
+
+Anti-example (never do this): loosening a gate BECAUSE it just rejected
+your proposal — e.g. your LONG was blocked by the RSI guard and you
+immediately re-propose with rsi_overbought=85. Adjustments must come
+from regime evidence stated BEFORE the rejection, not from the desire
+to get a specific trade through. That pattern is logged and reviewed.
+
+Every trade proposal should also carry a fixed `thesis` and
+`invalidation` (the price/condition that proves the thesis wrong) in its
+analysis block — the invalidation is locked at entry and must not move.
+
 # Executor config schema (required)
 
 `manage_executors(action="create")` expects these fields — malformed
@@ -239,8 +312,16 @@ dashboard — put only conclusions in it, never reasoning or chain-of-thought.
  "trend": "one short phrase", "volatility": "low|normal|high",
  "action": "WAIT|WATCH|LONG|SHORT", "strategy": "grid|momentum|mean_reversion|breakout|none",
  "confidence": 0.0, "narrative": "dominant narrative name or none",
+ "thesis": "one sentence; required for LONG/SHORT",
+ "invalidation": "price/condition that proves the thesis wrong; locked at entry",
+ "gate_adjustments": {"entry_gate.rsi_overbought": {"value": 80, "reason": "..."}},
  "evidence": "one-sentence evidence summary"}
 ```
+
+`gate_adjustments` is optional and only meaningful when it accompanies a
+proposal in the same cycle (see the Gate adjustments section); omit it
+for WAIT/WATCH. `thesis`/`invalidation` are required for actionable
+(LONG/SHORT) blocks.
 
 Use the standard regime vocabulary exactly as listed — it feeds
 regime-attribution analytics. Use UNCERTAIN when evidence is mixed;
