@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -74,6 +75,16 @@ AGENT_VERSION_TAG = "v1.5-kimi-manual"
 LLM_MODEL_TAG = "kimi-code"
 ACTIONS = {"WAIT", "WATCH", "PROPOSE_GRID", "PROPOSE_POSITION"}
 DEFAULT_EXECUTOR_CONNECTOR = "binance_perpetual_testnet"
+
+# follow_up verdict deadband: |change| below this is noise, never a
+# confirmation/falsification signal regardless of direction
+NOISE_DEADBAND_PCT = 0.3
+
+# execute idempotency: a batch whose content fingerprint was executed
+# within this window is a re-run accident (e.g. retry after a grep
+# failure), not a new decision — skip it with exit code 0
+BATCH_STATE_PATH = REPO_ROOT / "data" / "kimi_executed_batches.jsonl"
+DUP_BATCH_WINDOW_MIN = 20
 
 
 # ---------------------------------------------------------------- wiring
@@ -149,6 +160,54 @@ def load_decisions(payload: Any) -> list[dict[str, Any]]:
     if not out:
         raise ValueError("decision file contains no decisions")
     return out
+
+
+# ------------------------------------------------------- batch idempotency
+
+
+def batch_fingerprint(decisions: list[dict[str, Any]]) -> str:
+    """Content fingerprint of the decisions array itself (sorted keys,
+    compact separators) — nothing time-varying is included, so re-running
+    the same file yields the same fingerprint."""
+    canonical = json.dumps(decisions, sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def find_duplicate_batch(fingerprint: str, dry_run: bool,
+                         path: Path | None = None,
+                         now: float | None = None,
+                         window_min: float = DUP_BATCH_WINDOW_MIN
+                         ) -> dict[str, Any] | None:
+    """The most recent state-file record with the same fingerprint inside
+    the dedup window, else None. dry_run and real batches are tracked
+    separately so a dry-run never blocks the real execution."""
+    path = path or BATCH_STATE_PATH
+    now = now if now is not None else time.time()
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (rec.get("fp") == fingerprint
+                and bool(rec.get("dry_run")) == bool(dry_run)
+                and now - float(rec.get("ts", 0)) <= window_min * 60):
+            return rec
+    return None
+
+
+def record_batch(fingerprint: str, dry_run: bool, count: int,
+                 path: Path | None = None) -> None:
+    path = Path(path or BATCH_STATE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"fp": fingerprint, "ts": time.time(),
+                            "dry_run": bool(dry_run), "count": count})
+                + "\n")
 
 
 def validate_decision(d: dict[str, Any]) -> list[str]:
@@ -679,16 +738,18 @@ class KimiBrain:
         if change_pct is None:
             return f"无 ref_price 或现价,无法跟踪{suffix}"
         c = change_pct
+        if abs(c) < NOISE_DEADBAND_PCT:
+            # noise deadband, direction-agnostic: sub-0.3% wiggles flip
+            # verdicts back and forth between cycles and dilute the signal
+            return f"{action} 后价格 {c:+.2f}%(持平(噪音)){suffix}"
         if action in ("WAIT", "WATCH"):
             # direction-aware: after WAIT/WATCH a price DROP means the
             # caution was correct (loss avoided); a RISE is opportunity
             # cost worth re-examining
-            if c <= -0.3:
+            if c <= -NOISE_DEADBAND_PCT:
                 comment = f"观望正确,规避下跌 {c:+.2f}%"
-            elif c >= 0.3:
-                comment = f"错过反弹 {c:+.2f}%,复核是否该更积极"
             else:
-                comment = "横盘,判断暂未被证伪"
+                comment = f"错过反弹 {c:+.2f}%,复核是否该更积极"
             return f"{action} 后价格 {c:+.2f}%({comment})"
         if action == "PROPOSE_GRID":
             comment = ("价格偏离区间假设,需复盘" if abs(c) >= 0.5
@@ -948,6 +1009,20 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         print(f"ERROR: cannot load decisions: {exc}", file=sys.stderr)
         return 2
 
+    # idempotency: re-running the same batch file within the window is a
+    # legal retry (e.g. output-grep failure), not a new decision — skip
+    fingerprint = batch_fingerprint(decisions)
+    if not args.force:
+        prev = find_duplicate_batch(fingerprint, args.dry_run,
+                                    BATCH_STATE_PATH)
+        if prev:
+            stamp = datetime.fromtimestamp(
+                float(prev["ts"]), tz=timezone.utc).isoformat(
+                    timespec="seconds")
+            print(f"DUPLICATE BATCH - skipped (first executed at {stamp}, "
+                  f"fingerprint {fingerprint})")
+            return 0
+
     guard, memory, analytics, agent = build_stacks()
     brain = KimiBrain(guard, memory, analytics, agent)
     try:
@@ -956,7 +1031,10 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         if analytics is not None:
             analytics.close()
         memory.close()
+    record_batch(fingerprint, args.dry_run, len(decisions),
+                 BATCH_STATE_PATH)
     print(json.dumps({"dry_run": args.dry_run, "mode": guard.mode,
+                      "fingerprint": fingerprint,
                       "results": results}, ensure_ascii=False, indent=2))
     return 0
 
@@ -976,6 +1054,9 @@ def main() -> None:
     p_ex.add_argument("decision_file")
     p_ex.add_argument("--dry-run", action="store_true",
                       help="validate + record only; no executor is created")
+    p_ex.add_argument("--force", action="store_true",
+                      help="replay even if the same batch fingerprint was "
+                           "executed inside the dedup window")
     args = parser.parse_args()
 
     if args.command == "context":

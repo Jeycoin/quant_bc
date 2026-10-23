@@ -31,13 +31,23 @@ async def collect_once(
             result = await provider.fetch(symbols)
             signals: list[IntelSignal] = result.get("signals", [])
             news: list[NewsEvent] = result.get("news", [])
+            # freshness honesty: a successful fetch whose newest signal
+            # timestamp did not advance means the SOURCE data is stale
+            # (e.g. alternative.me updates F&G once a day) — record the
+            # row for history but report "stale", not "ok"
+            prev_ts = (store.latest_signal_ts(provider.name)
+                       if signals else None)
             if signals:
                 store.record_signals(signals)
             inserted = sum(1 for n in news if store.record_news(n))
-            meta["providers"][provider.name] = {
-                "status": "ok", "signals": len(signals),
-                "news_new": inserted, "news_seen": len(news),
-            }
+            entry = {"status": "ok", "signals": len(signals),
+                     "news_new": inserted, "news_seen": len(news)}
+            if (signals and prev_ts is not None
+                    and max(s.ts for s in signals) <= prev_ts):
+                entry["status"] = "stale"
+                entry["reason"] = ("source data unchanged "
+                                   "(provider timestamp not advancing)")
+            meta["providers"][provider.name] = entry
         except Exception as exc:
             meta["providers"][provider.name] = {"status": "error",
                                                 "reason": str(exc)[:200]}

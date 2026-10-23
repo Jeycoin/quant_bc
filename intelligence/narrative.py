@@ -17,6 +17,13 @@ from typing import Any
 from intelligence.schema import Narrative
 from intelligence.store import IntelligenceStore
 
+# News-driven narratives decay with the age of their freshest supporting
+# headline: half-life in hours. A regulatory headline from this morning
+# must not anchor a 0.9-strength narrative tonight (observed:
+# regulatory_shock pinned at 0.9 / novelty 0 for 10+ hours off one old
+# news item re-evaluated every cycle).
+NEWS_NARRATIVE_HALFLIFE_H = 4.0
+
 
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
@@ -104,13 +111,22 @@ class NarrativeEngine:
 
         # --- regulatory shock: high-severity regulation news, fresh
         if "regulation" in news_cats and news_sev >= 0.75:
+            # strength decays with the age of the newest regulation
+            # headline (half-life NEWS_NARRATIVE_HALFLIFE_H); below
+            # min_strength the candidate is filtered downstream, so a
+            # stale shock fades out instead of lingering at full strength
+            reg_age_min = ((news_f.get("category_age_min") or {})
+                           .get("regulation"))
+            age_h = max(0.0, float(reg_age_min or 0.0)) / 60.0
+            decay = 0.5 ** (age_h / NEWS_NARRATIVE_HALFLIFE_H)
             candidates.append(Narrative(
                 name="regulatory_shock", symbol=symbol,
-                strength=_clip01(news_sev),
+                strength=_clip01(news_sev * decay),
                 social_momentum=0.4,
                 price_confirmation=_clip01(abs(change) / 10),
                 confidence=0.6,
-                evidence=[f"high-severity regulation news ({news_sev:.2f})"]))
+                evidence=[f"high-severity regulation news "
+                          f"({news_sev:.2f}, {age_h:.1f}h old)"]))
 
         out = []
         for n in candidates:

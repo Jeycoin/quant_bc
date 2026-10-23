@@ -7,6 +7,7 @@ Covers decision-file parsing, schema validation, the pre-gate pipeline
 the real gate methods are covered by their own test suites.
 """
 
+import argparse
 import asyncio
 import json
 import sys
@@ -552,7 +553,7 @@ def test_follow_up_wait_flat_market(tmp_path):
     fu = brain._follow_up(["BTC"], {"BTC": {"price": 81770.0}}, {})
     e = fu["BTC"]
     assert e["change_pct"] == -0.04
-    assert "横盘" in e["verdict"] and "暂未被证伪" in e["verdict"]
+    assert "持平(噪音)" in e["verdict"]  # inside the noise deadband
     assert e["thesis"] == "t" * 120  # truncated
     assert e["invalidation"] == "i" * 120
     assert e["age_min"] == 30.0
@@ -577,13 +578,31 @@ def test_follow_up_grid_and_no_ref_price(tmp_path):
     brain = _make_brain(tmp_path)
     _seed_kimi_decision(brain.analytics, "SOL", "PROPOSE_GRID",
                         outcome="EXECUTED", ref_price=100.0)
-    fu = brain._follow_up(["SOL"], {"SOL": {"price": 100.2}}, {})
+    # +0.4% drift: outside the deadband, still inside the range assumption
+    fu = brain._follow_up(["SOL"], {"SOL": {"price": 100.4}}, {})
     assert "区间假设暂成立" in fu["SOL"]["verdict"]
     _seed_kimi_decision(brain.analytics, "XRP", "WAIT")  # no ref_price
     fu = brain._follow_up(["XRP"], {"XRP": {"price": 1.3}}, {})
     assert "无法跟踪" in fu["XRP"]["verdict"]
 
 
+def test_follow_up_noise_deadband_all_directions(tmp_path):
+    brain = _make_brain(tmp_path)
+    # +0.25% after WAIT: inside the deadband -> flat/noise, not
+    # "missed bounce" flip-flopping
+    _seed_kimi_decision(brain.analytics, "BTC", "WAIT", ref_price=100.0)
+    fu = brain._follow_up(["BTC"], {"BTC": {"price": 100.25}}, {})
+    assert "持平(噪音)" in fu["BTC"]["verdict"]
+    # the deadband is direction-agnostic: a directional proposal in
+    # noise is flat too, not "validated"
+    _seed_kimi_decision(brain.analytics, "ETH", "PROPOSE_POSITION",
+                        side="LONG", outcome="EXECUTED", ref_price=100.0)
+    fu = brain._follow_up(["ETH"], {"ETH": {"price": 100.25}}, {})
+    assert "持平(噪音)" in fu["ETH"]["verdict"]
+    # -0.5% after WAIT: outside the deadband -> caution was correct
+    _seed_kimi_decision(brain.analytics, "SOL", "WAIT", ref_price=100.0)
+    fu = brain._follow_up(["SOL"], {"SOL": {"price": 99.5}}, {})
+    assert "观望正确" in fu["SOL"]["verdict"]
 def test_follow_up_reports_open_position_pnl(tmp_path):
     brain = _make_brain(tmp_path)
     _seed_kimi_decision(brain.analytics, "BTC", "WAIT", ref_price=84000.0)
@@ -780,3 +799,97 @@ def test_build_context_full_house_reports_no_missing(tmp_path):
     ctx = _run(brain.build_context())
     assert ctx["market_features_missing"] == []
     assert ctx["market_features_errors"] == {}
+
+
+# ------------------------------------------------------- batch idempotency
+
+
+def _cli_stacks(tmp_path):
+    guard = SafetyGuard(live_trading=False, config=CONFIG)
+    memory = MemoryStore(str(tmp_path / "mem.db"))
+    analytics = AnalyticsStore(str(tmp_path / "analytics.db"))
+    agent = build_gate_agent(guard, memory, analytics)
+    return guard, memory, analytics, agent
+
+
+def _run_cli_execute(tmp_path, monkeypatch, force=False):
+    monkeypatch.setattr(kimi_brain, "BATCH_STATE_PATH",
+                        tmp_path / "batches.jsonl")
+    monkeypatch.setattr(kimi_brain, "build_stacks",
+                        lambda: _cli_stacks(tmp_path))
+    args = argparse.Namespace(
+        decision_file=str(tmp_path / "batch.json"), dry_run=False,
+        force=force)
+    return asyncio.run(kimi_brain._cmd_execute(args))
+
+
+def _write_batch(tmp_path):
+    payload = {"decisions": [
+        {"symbol": "BTC", "action": "WAIT", "confidence": 0.6},
+        {"symbol": "ETH", "action": "WATCH", "confidence": 0.55},
+    ]}
+    (tmp_path / "batch.json").write_text(json.dumps(payload),
+                                         encoding="utf-8")
+
+
+def _count_decisions(tmp_path):
+    import sqlite3
+    conn = sqlite3.connect(str(tmp_path / "analytics.db"))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM decision_events") \
+            .fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_execute_same_batch_twice_is_idempotent(tmp_path, monkeypatch,
+                                                capsys):
+    _write_batch(tmp_path)
+    assert _run_cli_execute(tmp_path, monkeypatch) == 0
+    assert _count_decisions(tmp_path) == 2
+    capsys.readouterr()  # drop first-run output
+    assert _run_cli_execute(tmp_path, monkeypatch) == 0  # retry: skipped
+    assert "DUPLICATE BATCH" in capsys.readouterr().out
+    assert _count_decisions(tmp_path) == 2  # zero new rows
+
+
+def test_execute_force_replays_batch(tmp_path, monkeypatch):
+    _write_batch(tmp_path)
+    assert _run_cli_execute(tmp_path, monkeypatch) == 0
+    assert _run_cli_execute(tmp_path, monkeypatch, force=True) == 0
+    assert _count_decisions(tmp_path) == 4  # forced replay recorded again
+
+
+def test_execute_same_batch_after_window_allowed(tmp_path, monkeypatch):
+    _write_batch(tmp_path)
+    assert _run_cli_execute(tmp_path, monkeypatch) == 0
+    # age the state record beyond the 20-minute dedup window
+    state = tmp_path / "batches.jsonl"
+    rec = json.loads(state.read_text(encoding="utf-8").splitlines()[-1])
+    rec["ts"] = rec["ts"] - 21 * 60
+    state.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    assert _run_cli_execute(tmp_path, monkeypatch) == 0
+    assert _count_decisions(tmp_path) == 4  # same content, later: allowed
+
+
+def test_execute_dry_run_does_not_block_real_run(tmp_path, monkeypatch):
+    _write_batch(tmp_path)
+    monkeypatch.setattr(kimi_brain, "BATCH_STATE_PATH",
+                        tmp_path / "batches.jsonl")
+    monkeypatch.setattr(kimi_brain, "build_stacks",
+                        lambda: _cli_stacks(tmp_path))
+    args = argparse.Namespace(
+        decision_file=str(tmp_path / "batch.json"), dry_run=True,
+        force=False)
+    assert asyncio.run(kimi_brain._cmd_execute(args)) == 0
+    # a real run of the same content right after a dry-run must execute
+    assert _run_cli_execute(tmp_path, monkeypatch) == 0
+    assert _count_decisions(tmp_path) == 4  # 2 dry-run + 2 real
+
+
+def test_batch_fingerprint_key_order_independent():
+    a = [{"symbol": "BTC", "action": "WAIT", "confidence": 0.6}]
+    b = [{"action": "WAIT", "confidence": 0.6, "symbol": "BTC"}]
+    assert kimi_brain.batch_fingerprint(a) == kimi_brain.batch_fingerprint(b)
+    c = [{"symbol": "BTC", "action": "WAIT", "confidence": 0.61}]
+    assert kimi_brain.batch_fingerprint(a) != kimi_brain.batch_fingerprint(c)

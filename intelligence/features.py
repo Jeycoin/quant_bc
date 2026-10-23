@@ -132,6 +132,15 @@ def build_news_features(store: IntelligenceStore,
     for symbol in symbols:
         events = store.recent_news(asset=symbol, hours=24, limit=50)
         asset_events = [e for e in events if e["asset"] == symbol]
+        # freshest news age per category: narrative rules key on categories
+        # over a 24h window, so without this a single old headline keeps
+        # re-triggering its narrative at full strength all day
+        cat_age: dict[str, float] = {}
+        for e in asset_events:
+            age = _age(e["ts"], now)
+            cat = e.get("category") or "general"
+            if cat not in cat_age or age < cat_age[cat]:
+                cat_age[cat] = age
         out["symbols"][symbol] = {
             "news_volume_24h": len(asset_events),
             "high_severity_24h": sum(1 for e in asset_events
@@ -139,6 +148,7 @@ def build_news_features(store: IntelligenceStore,
             "max_severity_24h": max((e["severity"] or 0 for e in asset_events),
                                     default=0),
             "categories": sorted({e["category"] for e in asset_events}),
+            "category_age_min": cat_age,
         }
     top = sorted(store.recent_news(hours=12, limit=50),
                  key=lambda e: (e["severity"] or 0), reverse=True)[:5]

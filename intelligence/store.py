@@ -93,6 +93,15 @@ class IntelligenceStore:
         )
         self._conn.commit()
 
+    def latest_signal_ts(self, source: str) -> float | None:
+        """Newest stored signal timestamp for a provider (source name).
+        None when the provider has never written. Used by the collector to
+        tell 'fetch ok' apart from 'source data actually advanced'."""
+        row = self._conn.execute(
+            "SELECT MAX(ts) FROM intel_signals WHERE source = ?", (source,),
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     def recent_signals(self, kind: str | None = None, symbol: str | None = None,
                        hours: float = 24) -> list[dict[str, Any]]:
         q = "SELECT * FROM intel_signals WHERE ts >= ?"
